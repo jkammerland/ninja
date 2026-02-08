@@ -1864,6 +1864,7 @@ NORETURN void real_main(int argc, char** argv) {
       // manifest forever. Better to return immediately.
       if (config.dry_run)
         exit(0);
+      status->Info("regeneration complete; building requested targets...");
       // Start the build over with the new manifest.
       continue;
     } else if (!err.empty()) {

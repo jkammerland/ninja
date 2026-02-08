@@ -418,6 +418,42 @@ default out
 [1/1] touch out
 ''')
 
+    def test_regeneration_phase_marker_only_after_regen(self) -> None:
+        # The phase marker should only be emitted when manifest regeneration
+        # actually occurred.
+        self.assertEqual(run(
+'''rule touch
+  command = touch $out
+  description = touch $out
+
+build out: touch
+default out
+''', pipe=True),
+'''[1/1] touch out
+''')
+
+    def test_regeneration_phase_marker_after_manifest_restart(self) -> None:
+        # If manifest regeneration updated build.ninja and triggers a restart,
+        # print an explicit phase boundary before building user targets.
+        self.assertEqual(run(
+'''rule regen_once
+  command = [ -f .regen_done ] || (touch $out && touch .regen_done)
+  description = Regenerating...
+  restat = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: regen_once
+build out: touch
+default out
+''', pipe=True),
+'''[1/1] Regenerating...
+ninja: regeneration complete; building requested targets...
+[1/1] touch out
+''')
+
     def test_pr_1685(self) -> None:
         # Running those tools without .ninja_deps and .ninja_log shouldn't fail.
         self.assertEqual(run('', flags='-t recompact'), '')
