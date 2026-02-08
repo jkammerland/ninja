@@ -158,7 +158,8 @@ struct NinjaMain : public BuildLogUser {
   /// Rebuild the manifest, if necessary.
   /// Fills in \a err on error.
   /// @return true if the manifest was rebuilt.
-  bool RebuildManifest(const char* input_file, string* err, Status* status);
+  bool RebuildManifest(const char* input_file, string* err, Status* status,
+                       bool* manifest_phase_ran);
 
   /// For each edge, lookup in build log how long it took last time,
   /// and record that in the edge itself. It will be used for ETA prediction.
@@ -266,7 +267,8 @@ int GuessParallelism() {
 /// Rebuild the build manifest, if necessary.
 /// Returns true if the manifest was rebuilt.
 bool NinjaMain::RebuildManifest(const char* input_file, string* err,
-                                Status* status) {
+                                Status* status, bool* manifest_phase_ran) {
+  *manifest_phase_ran = false;
   string path = input_file;
   if (path.empty()) {
     *err = "empty path";
@@ -286,6 +288,7 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   if (builder.AlreadyUpToDate())
     return false;  // Not an error, but we didn't rebuild.
 
+  *manifest_phase_ran = true;
   if (builder.Build(err) != ExitSuccess)
     return false;
 
@@ -1859,7 +1862,9 @@ NORETURN void real_main(int argc, char** argv) {
       exit((ninja.*options.tool->func)(&options, argc, argv));
 
     // Attempt to rebuild the manifest before building anything else
-    if (ninja.RebuildManifest(options.input_file, &err, status)) {
+    bool manifest_phase_ran = false;
+    if (ninja.RebuildManifest(options.input_file, &err, status,
+                              &manifest_phase_ran)) {
       // In dry_run mode the regeneration will succeed without changing the
       // manifest forever. Better to return immediately.
       if (config.dry_run)
@@ -1870,6 +1875,8 @@ NORETURN void real_main(int argc, char** argv) {
     } else if (!err.empty()) {
       status->Error("rebuilding '%s': %s", options.input_file, err.c_str());
       exit(1);
+    } else if (manifest_phase_ran) {
+      status->Info("manifest check complete; building requested targets...");
     }
 
     ninja.ParsePreviousElapsedTimes();

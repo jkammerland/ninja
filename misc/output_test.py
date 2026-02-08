@@ -415,12 +415,13 @@ build out: touch
 default out
 ''', pipe=True),
 '''[1/1] Re-checking...
+ninja: manifest check complete; building requested targets...
 [1/1] touch out
 ''')
 
-    def test_regeneration_phase_marker_only_after_regen(self) -> None:
-        # The phase marker should only be emitted when manifest regeneration
-        # actually occurred.
+    def test_phase_marker_absent_without_manifest_phase(self) -> None:
+        # If there is no manifest rebuild/check work, no phase boundary marker
+        # should be emitted.
         self.assertEqual(run(
 '''rule touch
   command = touch $out
@@ -451,6 +452,47 @@ default out
 ''', pipe=True),
 '''[1/1] Regenerating...
 ninja: regeneration complete; building requested targets...
+[1/1] touch out
+''')
+
+    def test_regeneration_then_manifest_check_phase_markers(self) -> None:
+        # If a regeneration restart is followed by a check-only manifest phase,
+        # print an explicit phase boundary before each distinct phase.
+        with BuildDir('''rule regen_once
+  command = [ -f .regen_done ] || (cp build.ninja.next $out && touch .regen_done)
+  description = Re-running CMake...
+  restat = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: regen_once
+build out: touch
+default out
+''') as b:
+            with open(os.path.join(b.path, 'build.ninja.next'), 'w') as f:
+                f.write(dedent('''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch
+default out
+'''))
+
+            self.assertEqual(b.run(pipe=True),
+'''[1/1] Re-running CMake...
+ninja: regeneration complete; building requested targets...
+[1/1] Re-checking...
+ninja: manifest check complete; building requested targets...
 [1/1] touch out
 ''')
 
