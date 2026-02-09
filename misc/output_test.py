@@ -419,6 +419,44 @@ ninja: manifest check complete; building requested targets...
 [1/1] touch out
 ''')
 
+    def test_manifest_check_with_directory_input(self) -> None:
+        # Generator edges can depend on directories and re-run when
+        # directory entries change.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify src
+build out: touch
+default out
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+
+            self.assertEqual(b.run(pipe=True),
+'''[1/1] Re-checking...
+ninja: manifest check complete; building requested targets...
+[1/1] touch out
+''')
+
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            # Touch directory mtime by adding a new entry.
+            with open(os.path.join(src_dir, 'new.cc'), 'w'):
+                pass
+
+            self.assertEqual(b.run(pipe=True),
+'''[1/1] Re-checking...
+ninja: manifest check complete; building requested targets...
+ninja: no work to do.
+''')
+
     def test_phase_marker_absent_without_manifest_phase(self) -> None:
         # If there is no manifest rebuild/check work, no phase boundary marker
         # should be emitted.
