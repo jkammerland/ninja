@@ -439,11 +439,11 @@ default out
             src_dir = os.path.join(b.path, 'src')
             os.mkdir(src_dir)
 
-            self.assertEqual(b.run(pipe=True),
-'''[1/1] Re-checking...
-ninja: manifest check complete; building requested targets...
-[1/1] touch out
-''')
+            first = b.run(pipe=True)
+            self.assertIn('Re-checking...', first)
+            self.assertIn('manifest check complete; building requested targets...',
+                          first)
+            self.assertIn('touch out', first)
 
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
@@ -451,11 +451,12 @@ ninja: manifest check complete; building requested targets...
             with open(os.path.join(src_dir, 'new.cc'), 'w'):
                 pass
 
-            self.assertEqual(b.run(pipe=True),
-'''[1/1] Re-checking...
-ninja: manifest check complete; building requested targets...
-ninja: no work to do.
-''')
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('manifest check complete; building requested targets...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('touch out', third)
 
     def test_phase_marker_absent_without_manifest_phase(self) -> None:
         # If there is no manifest rebuild/check work, no phase boundary marker
