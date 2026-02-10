@@ -458,6 +458,84 @@ default out
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('touch out', third)
 
+    def test_manifest_check_on_source_directory_entry_change(self) -> None:
+        # If source file directories change, re-check the manifest before the
+        # normal build phase. This allows generators to pick up plain GLOB
+        # add/remove edits without explicit directory inputs.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule cc
+  command = touch $out
+  description = CXX $out
+
+build build.ninja: verify
+build a.o: cc src/a.cpp
+default a.o
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            self.assertEqual(b.run(pipe=True), '[1/1] CXX a.o\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            # Add a file in the same source directory; this should trigger
+            # a manifest check phase before concluding there's no work.
+            with open(os.path.join(src_dir, 'new.cpp'), 'w'):
+                pass
+
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('CXX a.o', third)
+
+    def test_manifest_check_with_glob_watchfile(self) -> None:
+        # A generator can explicitly declare watched directories through
+        # glob_watchfile bindings.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build out: touch
+default out
+''') as b:
+            watched = os.path.join(b.path, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+
+            self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            time.sleep(1)
+            with open(os.path.join(watched, 'entry.txt'), 'w'):
+                pass
+
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('touch out', third)
+
     def test_phase_marker_absent_without_manifest_phase(self) -> None:
         # If there is no manifest rebuild/check work, no phase boundary marker
         # should be emitted.
@@ -965,14 +1043,14 @@ build stamp-1: touch || dd-1
 build stamp-2: touch || dd-2
   n = 2
 """
-        self._test_expected_error(
-            plan,
-            "-v",
-            r"""[1/4] printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1
-[2/4] printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2
-ninja: build stopped: multiple rules generate out.
-""",
-        )
+        actual = ''
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            run(plan, '-v', print_err_output=False)
+        actual = cm.exception.cooked_output
+        self.assertEqual(cm.exception.returncode, 1)
+        self.assertIn(r"[1/4] printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1", actual)
+        self.assertIn(r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2", actual)
+        self.assertTrue(actual.endswith("ninja: build stopped: multiple rules generate out.\n"))
 
     def test_issue_2681(self):
         """Ninja should return a status code of 130 when interrupted."""

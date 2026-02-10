@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -21,6 +22,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
+#include <sstream>
 #include <string>
 
 #ifdef _WIN32
@@ -264,6 +268,254 @@ int GuessParallelism() {
   }
 }
 
+bool HasLikelySourceSuffix(const string& path) {
+  static const char* const kSuffixes[] = {
+      ".c",   ".cc", ".cpp", ".cxx", ".c++", ".m",
+      ".mm",  ".S",  ".s",   ".asm", ".cu",  ".rc",
+  };
+  const size_t dot = path.rfind('.');
+  if (dot == string::npos)
+    return false;
+  const string suffix = path.substr(dot);
+  for (size_t i = 0; i < sizeof(kSuffixes) / sizeof(kSuffixes[0]); ++i) {
+    if (suffix == kSuffixes[i])
+      return true;
+  }
+  return false;
+}
+
+bool IsAbsolutePathForWatch(const string& path) {
+  if (path.empty())
+    return false;
+  if (path[0] == '/')
+    return true;
+#ifdef _WIN32
+  if (path.size() >= 3 && isalpha(path[0]) && path[1] == ':' && path[2] == '/')
+    return true;
+#endif
+  return false;
+}
+
+string PathDirName(const string& path) {
+  string::size_type slash_pos = path.find_last_of('/');
+  if (slash_pos == string::npos)
+    return ".";
+  if (slash_pos == 0)
+    return "/";
+  return path.substr(0, slash_pos);
+}
+
+string ParentPath(const string& path) {
+  if (path.empty() || path == "." || path == "/")
+    return string();
+  const string::size_type slash_pos = path.find_last_of('/');
+  if (slash_pos == string::npos)
+    return string();
+  if (slash_pos == 0)
+    return "/";
+  return path.substr(0, slash_pos);
+}
+
+void AddDirectoryAndAncestorsForWatch(const string& dir, set<string>* dirs) {
+  if (dir.empty()) {
+    dirs->insert(".");
+    return;
+  }
+
+  dirs->insert(dir);
+  if (IsAbsolutePathForWatch(dir))
+    return;
+
+  string parent = ParentPath(dir);
+  while (!parent.empty() && parent != "." && parent != "/") {
+    dirs->insert(parent);
+    parent = ParentPath(parent);
+  }
+}
+
+string TrimAsciiWhitespace(string input) {
+  const string::size_type start = input.find_first_not_of(" \t\r\n");
+  if (start == string::npos)
+    return string();
+  const string::size_type end = input.find_last_not_of(" \t\r\n");
+  return input.substr(start, end - start + 1);
+}
+
+void CollectSourceDirectoriesFromManifest(const State& state,
+                                          set<string>* dirs) {
+  for (vector<Edge*>::const_iterator e = state.edges_.begin();
+       e != state.edges_.end(); ++e) {
+    for (vector<Node*>::const_iterator i = (*e)->inputs_.begin();
+         i != (*e)->inputs_.end(); ++i) {
+      Node* node = *i;
+      if (node->in_edge() != NULL)
+        continue;
+      if (node->generated_by_dep_loader())
+        continue;
+      if (!HasLikelySourceSuffix(node->path()))
+        continue;
+      AddDirectoryAndAncestorsForWatch(PathDirName(node->path()), dirs);
+    }
+  }
+}
+
+bool ParseWatchDirectoryFile(const string& content, set<string>* dirs) {
+  istringstream in(content);
+  string line;
+  bool has_header = false;
+  while (getline(in, line)) {
+    const string trimmed = TrimAsciiWhitespace(line);
+    if (trimmed.empty() || trimmed[0] == '#')
+      continue;
+    if (!has_header && trimmed == "ninja_glob_watch_dirs_v1") {
+      has_header = true;
+      continue;
+    }
+
+    string path = trimmed;
+    uint64_t slash_bits;
+    CanonicalizePath(&path, &slash_bits);
+    AddDirectoryAndAncestorsForWatch(path, dirs);
+  }
+  return true;
+}
+
+bool LoadWatchedDirectories(Edge* manifest_edge, const State& state,
+                            DiskInterface* disk_interface, set<string>* dirs,
+                            string* err) {
+  if (!manifest_edge)
+    return true;
+
+  string watchfile = manifest_edge->GetUnescapedBinding("glob_watchfile");
+  if (watchfile.empty()) {
+    CollectSourceDirectoriesFromManifest(state, dirs);
+    return true;
+  }
+
+  uint64_t slash_bits;
+  CanonicalizePath(&watchfile, &slash_bits);
+  string watchfile_content;
+  string read_err;
+  FileReader::Status watch_status =
+      disk_interface->ReadFile(watchfile, &watchfile_content, &read_err);
+  if (watch_status == FileReader::NotFound) {
+    *err = "glob watch file '" + watchfile + "' not found";
+    return false;
+  }
+  if (watch_status != FileReader::Okay) {
+    *err = "loading glob watch file '" + watchfile + "': " + read_err;
+    return false;
+  }
+
+  return ParseWatchDirectoryFile(watchfile_content, dirs);
+}
+
+string DirectoryWatchCachePath(const string& build_dir) {
+  if (build_dir.empty())
+    return ".ninja_glob_dirs";
+  return build_dir + "/.ninja_glob_dirs";
+}
+
+bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
+                             map<string, TimeStamp>* mtimes, bool* found,
+                             string* err) {
+  *found = false;
+  string content;
+  string read_err;
+  FileReader::Status status = disk_interface->ReadFile(path, &content, &read_err);
+  if (status == FileReader::NotFound)
+    return true;
+  if (status != FileReader::Okay) {
+    *err = "loading '" + path + "': " + read_err;
+    return false;
+  }
+
+  istringstream in(content);
+  string line;
+  if (!getline(in, line))
+    return true;
+  if (TrimAsciiWhitespace(line) != "ninja_glob_dirs_v1")
+    return true;
+
+  while (getline(in, line)) {
+    if (line.empty())
+      continue;
+    const string::size_type sep = line.find('\t');
+    if (sep == string::npos)
+      continue;
+    const string key = line.substr(0, sep);
+    const string value = line.substr(sep + 1);
+    char* end = NULL;
+    TimeStamp mtime = static_cast<TimeStamp>(strtoll(value.c_str(), &end, 10));
+    if (!end || *end != '\0')
+      continue;
+    (*mtimes)[key] = mtime;
+  }
+
+  *found = true;
+  return true;
+}
+
+bool WriteDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
+                              const map<string, TimeStamp>& mtimes, string* err) {
+  string content = "ninja_glob_dirs_v1\n";
+  for (map<string, TimeStamp>::const_iterator i = mtimes.begin();
+       i != mtimes.end(); ++i) {
+    content.append(i->first);
+    content.push_back('\t');
+    content.append(to_string(i->second));
+    content.push_back('\n');
+  }
+
+  if (!disk_interface->WriteFile(path, content, false)) {
+    *err = "writing '" + path + "' failed";
+    return false;
+  }
+  return true;
+}
+
+bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
+                                         DiskInterface* disk_interface,
+                                         const string& build_dir, bool* changed,
+                                         string* err) {
+  *changed = false;
+
+  set<string> watched_dirs;
+  if (!LoadWatchedDirectories(manifest_edge, *state, disk_interface,
+                              &watched_dirs, err)) {
+    return false;
+  }
+  if (watched_dirs.empty())
+    return true;
+
+  map<string, TimeStamp> current_mtimes;
+  for (set<string>::const_iterator d = watched_dirs.begin();
+       d != watched_dirs.end(); ++d) {
+    string stat_err;
+    TimeStamp mtime = disk_interface->Stat(*d, &stat_err);
+    if (mtime < 0) {
+      *err = "stat(" + *d + "): " + stat_err;
+      return false;
+    }
+    current_mtimes[*d] = mtime;
+  }
+
+  const string cache_path = DirectoryWatchCachePath(build_dir);
+  map<string, TimeStamp> old_mtimes;
+  bool found_cache = false;
+  if (!LoadDirectoryWatchCache(disk_interface, cache_path, &old_mtimes,
+                               &found_cache, err)) {
+    return false;
+  }
+  if (found_cache && old_mtimes != current_mtimes)
+    *changed = true;
+
+  if (!WriteDirectoryWatchCache(disk_interface, cache_path, current_mtimes, err))
+    return false;
+
+  return true;
+}
+
 /// Rebuild the build manifest, if necessary.
 /// Returns true if the manifest was rebuilt.
 bool NinjaMain::RebuildManifest(const char* input_file, string* err,
@@ -279,6 +531,23 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   Node* node = state_.LookupNode(path);
   if (!node)
     return false;
+
+  bool watch_changed = false;
+  if (!ComputeManifestDirectoryWatchChange(
+          &state_, node->in_edge(), &disk_interface_, build_dir_,
+          &watch_changed, err)) {
+    return false;
+  }
+  if (watch_changed) {
+    if (Edge* edge = node->in_edge()) {
+      for (vector<Node*>::iterator o = edge->outputs_.begin();
+           o != edge->outputs_.end(); ++o) {
+        (*o)->MarkMissing();
+      }
+    } else {
+      node->MarkMissing();
+    }
+  }
 
   Builder builder(&state_, config_, &build_log_, &deps_log_, &disk_interface_,
                   status, start_time_millis_);

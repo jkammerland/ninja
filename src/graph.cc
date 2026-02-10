@@ -520,19 +520,21 @@ bool Edge::GetBindingBool(const string& key) const {
   return !GetBinding(key).empty();
 }
 
-string Edge::GetUnescapedDepfile() const {
+std::string Edge::GetUnescapedBinding(const std::string& key) const {
   EdgeEnv env(this, EdgeEnv::kDoNotEscape);
-  return env.LookupVariable("depfile");
+  return env.LookupVariable(key);
+}
+
+string Edge::GetUnescapedDepfile() const {
+  return GetUnescapedBinding("depfile");
 }
 
 string Edge::GetUnescapedDyndep() const {
-  EdgeEnv env(this, EdgeEnv::kDoNotEscape);
-  return env.LookupVariable("dyndep");
+  return GetUnescapedBinding("dyndep");
 }
 
 std::string Edge::GetUnescapedRspfile() const {
-  EdgeEnv env(this, EdgeEnv::kDoNotEscape);
-  return env.LookupVariable("rspfile");
+  return GetUnescapedBinding("rspfile");
 }
 
 void Edge::Dump(const char* prefix) const {
