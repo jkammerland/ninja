@@ -497,6 +497,42 @@ default a.o
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('CXX a.o', third)
 
+    def test_manifest_check_on_non_source_suffix_input_change(self) -> None:
+        # Plain glob-like manifests can include arbitrary file extensions, not
+        # just C/C++ sources.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule copy
+  command = touch $out
+  description = COPY $out
+
+build build.ninja: verify
+build out: copy assets/data.txt
+default out
+''') as b:
+            assets_dir = os.path.join(b.path, 'assets')
+            os.mkdir(assets_dir)
+            with open(os.path.join(assets_dir, 'data.txt'), 'w'):
+                pass
+
+            self.assertEqual(b.run(pipe=True), '[1/1] COPY out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            with open(os.path.join(assets_dir, 'new.json'), 'w'):
+                pass
+
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('COPY out', third)
+
     def test_manifest_check_with_glob_watchfile(self) -> None:
         # A generator can explicitly declare watched directories through
         # glob_watchfile bindings.
@@ -535,6 +571,103 @@ default out
                           third)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('touch out', third)
+
+    def test_manifest_check_with_glob_watchfile_and_source_dirs(self) -> None:
+        # glob_watchfile entries should extend, not replace, inferred source
+        # directory watching.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule cc
+  command = touch $out
+  description = CXX $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build a.o: cc src/a.cpp
+default a.o
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            watched = os.path.join(b.path, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+
+            self.assertEqual(b.run(pipe=True), '[1/1] CXX a.o\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            # Source dir changes should still trigger a manifest check even
+            # when glob_watchfile is set.
+            with open(os.path.join(src_dir, 'new.cpp'), 'w'):
+                pass
+
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('CXX a.o', third)
+
+    def test_manifest_check_missing_glob_watchfile(self) -> None:
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  restat = 1
+  generator = 1
+
+build build.ninja: verify
+  glob_watchfile = missing_watch_dirs.txt
+''') as b:
+            proc = subprocess.run(
+                [NINJA_PATH],
+                cwd=b.path,
+                env=default_env,
+                capture_output=True,
+                check=False,
+                text=True)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, '')
+            self.assertEqual(
+                proc.stderr,
+                "ninja: error: rebuilding 'build.ninja': "
+                "glob watch file 'missing_watch_dirs.txt' not found\n")
+
+    def test_manifest_check_unreadable_glob_watchfile(self) -> None:
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  restat = 1
+  generator = 1
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+''') as b:
+            watchfile = os.path.join(b.path, 'watch_dirs.txt')
+            with open(watchfile, 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+            os.chmod(watchfile, 0)
+
+            proc = subprocess.run(
+                [NINJA_PATH],
+                cwd=b.path,
+                env=default_env,
+                capture_output=True,
+                check=False,
+                text=True)
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, '')
+            self.assertIn("ninja: error: rebuilding 'build.ninja': ", proc.stderr)
+            self.assertIn("loading glob watch file 'watch_dirs.txt': ", proc.stderr)
 
     def test_phase_marker_absent_without_manifest_phase(self) -> None:
         # If there is no manifest rebuild/check work, no phase boundary marker

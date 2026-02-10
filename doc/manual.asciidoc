@@ -1011,7 +1011,7 @@ keys.
 
 `glob_watchfile`:: Used only on build statements that regenerate the
   manifest (for example, `build build.ninja: ...`).  If present, it names
-  a text file listing directories to watch for entry changes.
+  a text file listing extra directories to watch for entry changes.
 +
   The watch file format is line-oriented UTF-8 text:
 +
@@ -1019,9 +1019,17 @@ keys.
   * optional comments starting with `#`
   * one directory path per non-empty line
 +
-  Ninja records and compares watched directory mtimes between runs. A change
+  Ninja records and compares watched directory mtimes between runs. It
+  always includes directories inferred from manifest leaf inputs, and adds
+  any directories listed by `glob_watchfile`.
++
+  Cached mtimes are stored in `.ninja_glob_dirs` under `builddir` (or next
+  to the manifest when `builddir` is unset). A detected directory-entry change
   triggers a manifest check/regeneration phase before building requested
-  targets.
+  targets. Detection uses normal `stat()` mtime semantics.
++
+  Inferred watching intentionally skips the working directory root (`.`) to
+  avoid self-triggering on Ninja bookkeeping files.
 
 `generator`:: if present, specifies that this rule is used to
   re-invoke the generator program.  Files built using `generator`
@@ -1035,7 +1043,7 @@ keys.
   dirty and trigger manifest checks/regeneration.
 +
   For manifest regeneration edges, Ninja also tracks directories of
-  manifest-listed source file inputs and can trigger an early manifest
+  manifest-listed leaf inputs and can trigger an early manifest
   check when source directory entries change.
 
 `in`:: the space-separated list of files provided as inputs to the build line
