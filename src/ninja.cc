@@ -298,6 +298,37 @@ bool IsPathOrSubpath(const string& path, const string& parent) {
          path[parent.size()] == '/';
 }
 
+bool HasStringSuffix(const string& value, const char* suffix) {
+  const size_t suffix_len = strlen(suffix);
+  return value.size() >= suffix_len &&
+         value.compare(value.size() - suffix_len, suffix_len, suffix) == 0;
+}
+
+string LowercaseASCII(string value) {
+  for (string::iterator i = value.begin(); i != value.end(); ++i) {
+    if (*i >= 'A' && *i <= 'Z')
+      *i = *i - 'A' + 'a';
+  }
+  return value;
+}
+
+bool ShouldInferWatchDirectoryForInput(const string& path) {
+  const string lower = LowercaseASCII(path);
+  if (HasStringSuffix(lower, ".so") || lower.find(".so.") != string::npos)
+    return false;
+
+  static const char* const kSkippedSuffixes[] = {
+      ".a", ".lib", ".dll", ".dylib", ".tbd", ".o", ".obj", ".pdb", ".exp",
+      ".ilk",
+  };
+  for (size_t i = 0; i < sizeof(kSkippedSuffixes) / sizeof(kSkippedSuffixes[0]);
+       ++i) {
+    if (HasStringSuffix(lower, kSkippedSuffixes[i]))
+      return false;
+  }
+  return true;
+}
+
 string AbsoluteBuildDirForWatch(const string& build_dir) {
   string normalized_build_dir = build_dir.empty() ? "." : build_dir;
   uint64_t slash_bits;
@@ -349,6 +380,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
       if (node->in_edge() != NULL)
         continue;
       if (node->generated_by_dep_loader())
+        continue;
+      if (!ShouldInferWatchDirectoryForInput(node->path()))
         continue;
       AddDirectoryForWatch(PathDirName(node->path()), dirs);
     }
