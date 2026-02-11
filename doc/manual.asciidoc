@@ -1020,8 +1020,9 @@ keys.
   * one directory path per non-empty line
 +
   Ninja records and compares watched directory mtimes between runs. It
-  always includes directories inferred from manifest leaf inputs, and adds
-  any directories listed by `glob_watchfile`.
+  uses directories listed by `glob_watchfile` as the authoritative watch set.
+  If `glob_watchfile` is omitted, Ninja infers watched directories from
+  manifest leaf inputs.
 +
   Cached mtimes are stored in `.ninja_glob_dirs` under `builddir` (or next
   to the manifest when `builddir` is unset). A detected directory-entry change

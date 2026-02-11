@@ -409,13 +409,16 @@ bool ParseWatchDirectoryFile(const string& content, set<string>* dirs) {
 
 bool LoadGlobWatchfileDirectories(Edge* manifest_edge,
                                   DiskInterface* disk_interface,
-                                  set<string>* dirs, string* err) {
+                                  set<string>* dirs, bool* has_watchfile,
+                                  string* err) {
+  *has_watchfile = false;
   if (!manifest_edge)
     return true;
 
   string watchfile = manifest_edge->GetUnescapedBinding("glob_watchfile");
   if (watchfile.empty())
     return true;
+  *has_watchfile = true;
 
   uint64_t slash_bits;
   CanonicalizePath(&watchfile, &slash_bits);
@@ -591,21 +594,29 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
   if (!LoadDirectoryWatchCache(disk_interface, cache_path, &cache, err))
     return false;
 
-  set<string> inferred_dirs;
-  bool reuse_cached_inferred_dirs =
-      cache.found && cache.has_manifest_entry &&
-      cache.manifest_path == manifest_path &&
-      cache.manifest_mtime == manifest_mtime;
-  if (reuse_cached_inferred_dirs) {
-    inferred_dirs = cache.inferred_dirs;
-  } else {
-    CollectLeafInputDirectoriesFromManifest(*state, manifest_edge, &inferred_dirs);
+  set<string> watchfile_dirs;
+  bool has_watchfile = false;
+  if (!LoadGlobWatchfileDirectories(manifest_edge, disk_interface,
+                                    &watchfile_dirs, &has_watchfile, err)) {
+    return false;
   }
 
-  set<string> watched_dirs = inferred_dirs;
-  if (!LoadGlobWatchfileDirectories(manifest_edge, disk_interface,
-                                    &watched_dirs, err)) {
-    return false;
+  set<string> inferred_dirs;
+  set<string> watched_dirs;
+  if (has_watchfile) {
+    watched_dirs = watchfile_dirs;
+  } else {
+    bool reuse_cached_inferred_dirs =
+        cache.found && cache.has_manifest_entry &&
+        cache.manifest_path == manifest_path &&
+        cache.manifest_mtime == manifest_mtime;
+    if (reuse_cached_inferred_dirs) {
+      inferred_dirs = cache.inferred_dirs;
+    } else {
+      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge,
+                                              &inferred_dirs);
+    }
+    watched_dirs = inferred_dirs;
   }
 
   const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);

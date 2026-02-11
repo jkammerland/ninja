@@ -572,9 +572,9 @@ default out
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('touch out', third)
 
-    def test_manifest_check_with_glob_watchfile_and_source_dirs(self) -> None:
-        # glob_watchfile entries should extend, not replace, inferred source
-        # directory watching.
+    def test_manifest_check_with_glob_watchfile_prefers_explicit_dirs(self) -> None:
+        # If glob_watchfile is set, its entries are authoritative and inferred
+        # source-directory watching is skipped.
         with BuildDir('''rule verify
   command = printf ""
   description = Re-checking...
@@ -605,17 +605,25 @@ default a.o
             self.assertEqual(b.run(pipe=True), '[1/1] CXX a.o\n')
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
-            # Source dir changes should still trigger a manifest check even
-            # when glob_watchfile is set.
+            # Source dir changes should not trigger manifest checks when
+            # glob_watchfile is present.
             with open(os.path.join(src_dir, 'new.cpp'), 'w'):
                 pass
 
             third = b.run(pipe=True)
-            self.assertIn('Re-checking...', third)
+            self.assertEqual(third, 'ninja: no work to do.\n')
+
+            # Explicitly watched dirs still trigger.
+            time.sleep(1)
+            with open(os.path.join(watched, 'entry.txt'), 'w'):
+                pass
+
+            fourth = b.run(pipe=True)
+            self.assertIn('Re-checking...', fourth)
             self.assertIn('regeneration complete; restarting with updated manifest...',
-                          third)
-            self.assertIn('ninja: no work to do.', third)
-            self.assertNotIn('CXX a.o', third)
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+            self.assertNotIn('CXX a.o', fourth)
 
     def test_manifest_check_missing_glob_watchfile(self) -> None:
         with BuildDir('''rule verify
