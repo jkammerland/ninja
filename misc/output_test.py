@@ -168,6 +168,28 @@ class Output(unittest.TestCase):
             self.assertEqual(cm.exception.returncode, exit_code)
         self.assertEqual(expected, actual)
 
+    def _create_file_and_advance_dir_mtime(
+        self,
+        directory: str,
+        filename: str,
+        content: str = '',
+        timeout_secs: float = 5.0,
+    ) -> str:
+        """Create |filename| inside |directory| and ensure the directory mtime ticks."""
+        before = os.stat(directory).st_mtime_ns
+        path = os.path.join(directory, filename)
+        deadline = time.time() + timeout_secs
+        while True:
+            with open(path, 'w') as f:
+                f.write(content)
+            if os.stat(directory).st_mtime_ns != before:
+                return path
+            os.unlink(path)
+            if time.time() >= deadline:
+                self.fail(
+                    f"directory mtime for '{directory}' did not advance")
+            time.sleep(0.02)
+
     def test_issue_1418(self) -> None:
         self.assertEqual(run(
 '''rule echo
@@ -448,8 +470,7 @@ default out
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
             # Touch directory mtime by adding a new entry.
-            with open(os.path.join(src_dir, 'new.cc'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cc')
 
             third = b.run(pipe=True)
             self.assertIn('Re-checking...', third)
@@ -487,8 +508,7 @@ default a.o
 
             # Add a file in the same source directory; this should trigger
             # a manifest check phase before concluding there's no work.
-            with open(os.path.join(src_dir, 'new.cpp'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
 
             third = b.run(pipe=True)
             self.assertIn('Re-checking...', third)
@@ -523,8 +543,8 @@ default out
             self.assertEqual(b.run(pipe=True), '[1/1] COPY out\n')
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
-            with open(os.path.join(assets_dir, 'new.json'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(
+                assets_dir, 'new.json')
 
             third = b.run(pipe=True)
             self.assertIn('Re-checking...', third)
@@ -561,9 +581,7 @@ default out
             self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
-            time.sleep(1)
-            with open(os.path.join(watched, 'entry.txt'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(watched, 'entry.txt')
 
             third = b.run(pipe=True)
             self.assertIn('Re-checking...', third)
@@ -607,16 +625,13 @@ default a.o
 
             # Source dir changes should not trigger manifest checks when
             # glob_watchfile is present.
-            with open(os.path.join(src_dir, 'new.cpp'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
 
             third = b.run(pipe=True)
             self.assertEqual(third, 'ninja: no work to do.\n')
 
             # Explicitly watched dirs still trigger.
-            time.sleep(1)
-            with open(os.path.join(watched, 'entry.txt'), 'w'):
-                pass
+            self._create_file_and_advance_dir_mtime(watched, 'entry.txt')
 
             fourth = b.run(pipe=True)
             self.assertIn('Re-checking...', fourth)
@@ -649,7 +664,42 @@ build build.ninja: verify
                 "ninja: error: rebuilding 'build.ninja': "
                 "glob watch file 'missing_watch_dirs.txt' not found\n")
 
+    def test_manifest_check_ignores_absolute_watch_dirs_under_builddir(self) -> None:
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build out: touch src/a.cpp
+default out
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            ignored = os.path.join(b.path, 'ignored')
+            os.mkdir(ignored)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write(os.path.join(b.path, 'ignored') + '\n')
+
+            self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(ignored, 'entry.txt')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
     def test_manifest_check_unreadable_glob_watchfile(self) -> None:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('root can bypass unreadable file permissions')
         with BuildDir('''rule verify
   command = printf ""
   description = Re-checking...
@@ -676,6 +726,71 @@ build build.ninja: verify
             self.assertEqual(proc.stdout, '')
             self.assertIn("ninja: error: rebuilding 'build.ninja': ", proc.stderr)
             self.assertIn("loading glob watch file 'watch_dirs.txt': ", proc.stderr)
+
+    def test_manifest_check_when_watched_directory_disappears(self) -> None:
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  restat = 1
+  generator = 1
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+''') as b:
+            watched = os.path.join(b.path, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            os.rmdir(watched)
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+
+    def test_manifest_check_error_when_watched_directory_stat_fails(self) -> None:
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('root can bypass directory permission checks')
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  restat = 1
+  generator = 1
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+''') as b:
+            denied_parent = os.path.join(b.path, 'denied')
+            os.mkdir(denied_parent)
+            os.mkdir(os.path.join(denied_parent, 'sub'))
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('denied/sub\n')
+
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            try:
+                os.chmod(denied_parent, 0)
+                proc = subprocess.run(
+                    [NINJA_PATH],
+                    cwd=b.path,
+                    env=default_env,
+                    capture_output=True,
+                    check=False,
+                    text=True)
+            finally:
+                os.chmod(denied_parent, 0o700)
+
+            self.assertEqual(proc.returncode, 1)
+            self.assertEqual(proc.stdout, '')
+            self.assertIn(
+                "ninja: error: rebuilding 'build.ninja': stat(denied/sub): ",
+                proc.stderr)
 
     def test_phase_marker_absent_without_manifest_phase(self) -> None:
         # If there is no manifest rebuild/check work, no phase boundary marker
