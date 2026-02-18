@@ -347,6 +347,53 @@ string AbsoluteBuildDirForWatch(const string& build_dir) {
   return absolute_build_dir;
 }
 
+string AbsoluteWatchPath(const string& path) {
+  string normalized_path = path.empty() ? "." : path;
+  uint64_t slash_bits;
+  CanonicalizePath(&normalized_path, &slash_bits);
+  if (IsAbsolutePathForWatch(normalized_path))
+    return normalized_path;
+
+  string cwd = GetWorkingDirectory();
+  if (cwd.empty())
+    return string();
+  CanonicalizePath(&cwd, &slash_bits);
+  if (normalized_path == ".")
+    return cwd;
+  string absolute_path = cwd + "/" + normalized_path;
+  CanonicalizePath(&absolute_path, &slash_bits);
+  return absolute_path;
+}
+
+bool IsWatchPathUnderBuildDir(const string& path,
+                              const string& absolute_build_dir) {
+  if (absolute_build_dir.empty())
+    return false;
+  const string absolute_path = AbsoluteWatchPath(path);
+  if (absolute_path.empty())
+    return false;
+  return IsPathOrSubpath(absolute_path, absolute_build_dir);
+}
+
+bool IsDotDotRelativeWatchPath(const string& path) {
+  return path == ".." ||
+         (path.size() >= 3 && path[0] == '.' && path[1] == '.' &&
+          path[2] == '/');
+}
+
+void CollectGeneratedAbsoluteOutputsForWatch(const State& state,
+                                             set<string>* generated_outputs) {
+  for (vector<Edge*>::const_iterator e = state.edges_.begin();
+       e != state.edges_.end(); ++e) {
+    for (vector<Node*>::const_iterator o = (*e)->outputs_.begin();
+         o != (*e)->outputs_.end(); ++o) {
+      const string absolute_output = AbsoluteWatchPath((*o)->path());
+      if (!absolute_output.empty())
+        generated_outputs->insert(absolute_output);
+    }
+  }
+}
+
 void AddDirectoryForWatch(string dir, set<string>* dirs) {
   if (dir.empty())
     dir = ".";
@@ -370,6 +417,9 @@ string TrimAsciiWhitespace(string input) {
 void CollectLeafInputDirectoriesFromManifest(const State& state,
                                              const Edge* manifest_edge,
                                              set<string>* dirs) {
+  set<string> generated_absolute_outputs;
+  CollectGeneratedAbsoluteOutputsForWatch(state, &generated_absolute_outputs);
+
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
     if (*e == manifest_edge)
@@ -383,6 +433,12 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
         continue;
       if (!ShouldInferWatchDirectoryForInput(node->path()))
         continue;
+      const string input_absolute_path = AbsoluteWatchPath(node->path());
+      if (!input_absolute_path.empty() &&
+          generated_absolute_outputs.find(input_absolute_path) !=
+              generated_absolute_outputs.end()) {
+        continue;
+      }
       AddDirectoryForWatch(PathDirName(node->path()), dirs);
     }
   }
@@ -615,6 +671,36 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
     } else {
       CollectLeafInputDirectoriesFromManifest(*state, manifest_edge,
                                               &inferred_dirs);
+    }
+
+    const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);
+    bool has_inferred_outside_builddir = false;
+    for (set<string>::const_iterator d = inferred_dirs.begin();
+         d != inferred_dirs.end(); ++d) {
+      if (IsDotDotRelativeWatchPath(*d) ||
+          !IsWatchPathUnderBuildDir(*d, absolute_build_dir)) {
+        has_inferred_outside_builddir = true;
+        break;
+      }
+    }
+
+    // In out-of-source builds, mixed inferred sets can include source dirs
+    // outside the build dir and build-local side-effect artifacts. Only keep
+    // the source-side part of that mixed set to avoid regen loops.
+    if (has_inferred_outside_builddir) {
+      for (set<string>::iterator d = inferred_dirs.begin();
+           d != inferred_dirs.end();) {
+        if (IsDotDotRelativeWatchPath(*d)) {
+          ++d;
+          continue;
+        }
+        if (!IsAbsolutePathForWatch(*d) ||
+            IsWatchPathUnderBuildDir(*d, absolute_build_dir)) {
+          d = inferred_dirs.erase(d);
+          continue;
+        }
+        ++d;
+      }
     }
     watched_dirs = inferred_dirs;
   }

@@ -517,6 +517,158 @@ default a.o
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('CXX a.o', third)
 
+    def test_manifest_check_prunes_builddir_relative_inferred_dirs_out_of_source(
+            self) -> None:
+        # In mixed relative/absolute path aliases, generated build-local inputs
+        # should not be inferred as watched source directories.
+        with tempfile.TemporaryDirectory() as root:
+            source_root = os.path.join(root, 'srcroot')
+            build_dir = os.path.join(root, 'build')
+            os.mkdir(source_root)
+            os.mkdir(build_dir)
+
+            source_dir = os.path.join(source_root, 'src')
+            os.mkdir(source_dir)
+            source_file = os.path.join(source_dir, 'a.cpp')
+            with open(source_file, 'w'):
+                pass
+
+            generated_dir = os.path.join(build_dir, 'gen')
+            os.mkdir(generated_dir)
+            generated_file = os.path.join(generated_dir, 'generated.cpp')
+            with open(generated_file, 'w'):
+                pass
+
+            generated_abs = generated_file.replace('\\', '/')
+            with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
+                f.write(dedent(f'''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build {generated_abs}: phony
+build build.ninja: verify
+build out: touch ../srcroot/src/a.cpp gen/generated.cpp
+default out
+'''))
+
+            def run_in_build() -> str:
+                proc = subprocess.run(
+                    [NINJA_PATH],
+                    cwd=build_dir,
+                    env=default_env,
+                    capture_output=True,
+                    check=False,
+                    text=True)
+                self.assertEqual(proc.returncode, 0)
+                self.assertEqual(proc.stderr, '')
+                return proc.stdout
+
+            self.assertEqual(run_in_build(), '[1/1] touch out\n')
+            self.assertEqual(run_in_build(), 'ninja: no work to do.\n')
+
+            cache_path = os.path.join(build_dir, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
+            self._create_file_and_advance_dir_mtime(generated_dir, 'new.cpp')
+            self.assertEqual(run_in_build(), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(source_dir, 'new.cpp')
+            fourth = run_in_build()
+            self.assertIn('Re-checking...', fourth)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
+    def test_manifest_check_prunes_builddir_side_effect_dirs_out_of_source(
+            self) -> None:
+        # Out-of-source mixed sets can include build-local side-effect files
+        # that are not declared as outputs. Keep only source-side dirs.
+        with tempfile.TemporaryDirectory() as root:
+            source_root = os.path.join(root, 'srcroot')
+            build_dir = os.path.join(root, 'build')
+            os.mkdir(source_root)
+            os.mkdir(build_dir)
+
+            source_dir = os.path.join(source_root, 'src')
+            os.mkdir(source_dir)
+            with open(os.path.join(source_dir, 'a.cpp'), 'w'):
+                pass
+
+            generated_dir = os.path.join(build_dir, 'gen')
+            os.mkdir(generated_dir)
+            with open(os.path.join(generated_dir, 'generated.cpp'), 'w'):
+                pass
+
+            with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
+                f.write(dedent('''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch ../srcroot/src/a.cpp gen/generated.cpp
+default out
+'''))
+
+            def run_in_build() -> str:
+                proc = subprocess.run(
+                    [NINJA_PATH],
+                    cwd=build_dir,
+                    env=default_env,
+                    capture_output=True,
+                    check=False,
+                    text=True)
+                self.assertEqual(proc.returncode, 0)
+                self.assertEqual(proc.stderr, '')
+                return proc.stdout
+
+            self.assertEqual(run_in_build(), '[1/1] touch out\n')
+            self.assertEqual(run_in_build(), 'ninja: no work to do.\n')
+
+            cache_path = os.path.join(build_dir, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
+            self._create_file_and_advance_dir_mtime(generated_dir, 'new.cpp')
+            self.assertEqual(run_in_build(), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(source_dir, 'new.cpp')
+            fourth = run_in_build()
+            self.assertIn('Re-checking...', fourth)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
     def test_manifest_check_on_non_source_suffix_input_change(self) -> None:
         # Plain glob-like manifests can include arbitrary file extensions, not
         # just C/C++ sources.
