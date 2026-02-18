@@ -365,31 +365,30 @@ string AbsoluteWatchPath(const string& path) {
   return absolute_path;
 }
 
-bool IsWatchPathUnderBuildDir(const string& path,
-                              const string& absolute_build_dir) {
-  if (absolute_build_dir.empty())
-    return false;
-  const string absolute_path = AbsoluteWatchPath(path);
-  if (absolute_path.empty())
-    return false;
-  return IsPathOrSubpath(absolute_path, absolute_build_dir);
-}
-
 bool IsDotDotRelativeWatchPath(const string& path) {
   return path == ".." ||
          (path.size() >= 3 && path[0] == '.' && path[1] == '.' &&
           path[2] == '/');
 }
 
-void CollectGeneratedAbsoluteOutputsForWatch(const State& state,
-                                             set<string>* generated_outputs) {
+void AddDirectoryForWatch(string dir, set<string>* dirs);
+
+void CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
+    const State& state, const string& absolute_build_dir,
+    set<string>* generated_dirs) {
+  if (absolute_build_dir.empty())
+    return;
+
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
     for (vector<Node*>::const_iterator o = (*e)->outputs_.begin();
          o != (*e)->outputs_.end(); ++o) {
       const string absolute_output = AbsoluteWatchPath((*o)->path());
-      if (!absolute_output.empty())
-        generated_outputs->insert(absolute_output);
+      if (absolute_output.empty() ||
+          !IsPathOrSubpath(absolute_output, absolute_build_dir)) {
+        continue;
+      }
+      AddDirectoryForWatch(PathDirName(absolute_output), generated_dirs);
     }
   }
 }
@@ -416,9 +415,18 @@ string TrimAsciiWhitespace(string input) {
 
 void CollectLeafInputDirectoriesFromManifest(const State& state,
                                              const Edge* manifest_edge,
+                                             const string& build_dir,
                                              set<string>* dirs) {
-  set<string> generated_absolute_outputs;
-  CollectGeneratedAbsoluteOutputsForWatch(state, &generated_absolute_outputs);
+  struct LeafInput {
+    string dir_path;
+    string absolute_path;
+    bool under_build_dir;
+  };
+
+  const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);
+  vector<LeafInput> leaf_inputs;
+  bool has_inferred_outside_builddir = false;
+  bool has_builddir_inputs = false;
 
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
@@ -433,14 +441,50 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
         continue;
       if (!ShouldInferWatchDirectoryForInput(node->path()))
         continue;
-      const string input_absolute_path = AbsoluteWatchPath(node->path());
-      if (!input_absolute_path.empty() &&
-          generated_absolute_outputs.find(input_absolute_path) !=
-              generated_absolute_outputs.end()) {
+
+      LeafInput input;
+      input.dir_path = PathDirName(node->path());
+      input.absolute_path = AbsoluteWatchPath(node->path());
+      input.under_build_dir = !absolute_build_dir.empty() &&
+                              !input.absolute_path.empty() &&
+                              IsPathOrSubpath(input.absolute_path,
+                                              absolute_build_dir);
+
+      if (IsDotDotRelativeWatchPath(input.dir_path) || !input.under_build_dir)
+        has_inferred_outside_builddir = true;
+      if (input.under_build_dir)
+        has_builddir_inputs = true;
+
+      leaf_inputs.push_back(input);
+    }
+  }
+
+  set<string> generated_output_dirs_under_build_dir;
+  if (has_builddir_inputs && has_inferred_outside_builddir) {
+    CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
+        state, absolute_build_dir, &generated_output_dirs_under_build_dir);
+  }
+
+  for (vector<LeafInput>::const_iterator i = leaf_inputs.begin();
+       i != leaf_inputs.end(); ++i) {
+    if (!i->absolute_path.empty()) {
+      Node* absolute_alias = state.LookupNode(i->absolute_path);
+      if (absolute_alias && absolute_alias->in_edge() != NULL)
+        continue;
+    }
+
+    if (has_builddir_inputs && has_inferred_outside_builddir &&
+        i->under_build_dir) {
+      string absolute_input_dir = PathDirName(i->absolute_path);
+      uint64_t slash_bits;
+      CanonicalizePath(&absolute_input_dir, &slash_bits);
+      if (generated_output_dirs_under_build_dir.find(absolute_input_dir) !=
+          generated_output_dirs_under_build_dir.end()) {
         continue;
       }
-      AddDirectoryForWatch(PathDirName(node->path()), dirs);
     }
+
+    AddDirectoryForWatch(i->dir_path, dirs);
   }
 }
 
@@ -669,39 +713,10 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
     if (reuse_cached_inferred_dirs) {
       inferred_dirs = cache.inferred_dirs;
     } else {
-      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge,
+      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge, build_dir,
                                               &inferred_dirs);
     }
 
-    const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);
-    bool has_inferred_outside_builddir = false;
-    for (set<string>::const_iterator d = inferred_dirs.begin();
-         d != inferred_dirs.end(); ++d) {
-      if (IsDotDotRelativeWatchPath(*d) ||
-          !IsWatchPathUnderBuildDir(*d, absolute_build_dir)) {
-        has_inferred_outside_builddir = true;
-        break;
-      }
-    }
-
-    // In out-of-source builds, mixed inferred sets can include source dirs
-    // outside the build dir and build-local side-effect artifacts. Only keep
-    // the source-side part of that mixed set to avoid regen loops.
-    if (has_inferred_outside_builddir) {
-      for (set<string>::iterator d = inferred_dirs.begin();
-           d != inferred_dirs.end();) {
-        if (IsDotDotRelativeWatchPath(*d)) {
-          ++d;
-          continue;
-        }
-        if (!IsAbsolutePathForWatch(*d) ||
-            IsWatchPathUnderBuildDir(*d, absolute_build_dir)) {
-          d = inferred_dirs.erase(d);
-          continue;
-        }
-        ++d;
-      }
-    }
     watched_dirs = inferred_dirs;
   }
 

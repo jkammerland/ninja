@@ -190,6 +190,9 @@ class Output(unittest.TestCase):
                     f"directory mtime for '{directory}' did not advance")
             time.sleep(0.02)
 
+    def _escape_ninja_path(self, path: str) -> str:
+        return path.replace('$', '$$').replace(':', '$:').replace(' ', '$ ')
+
     def test_issue_1418(self) -> None:
         self.assertEqual(run(
 '''rule echo
@@ -539,7 +542,8 @@ default a.o
             with open(generated_file, 'w'):
                 pass
 
-            generated_abs = generated_file.replace('\\', '/')
+            generated_abs = self._escape_ninja_path(
+                generated_file.replace('\\', '/'))
             with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
                 f.write(dedent(f'''\
 rule verify
@@ -597,8 +601,9 @@ default out
 
     def test_manifest_check_prunes_builddir_side_effect_dirs_out_of_source(
             self) -> None:
-        # Out-of-source mixed sets can include build-local side-effect files
-        # that are not declared as outputs. Keep only source-side dirs.
+        # Out-of-source mixed sets can include build-local side-effect files in
+        # directories where generators also declare outputs. Keep source-side
+        # dirs and skip those generated-output directories.
         with tempfile.TemporaryDirectory() as root:
             source_root = os.path.join(root, 'srcroot')
             build_dir = os.path.join(root, 'build')
@@ -628,6 +633,7 @@ rule touch
   command = touch $out
   description = touch $out
 
+build gen/generated.h: phony
 build build.ninja: verify
 build out: touch ../srcroot/src/a.cpp gen/generated.cpp
 default out
