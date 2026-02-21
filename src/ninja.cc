@@ -290,12 +290,24 @@ bool IsAbsolutePathForWatch(const string& path) {
 }
 
 bool IsPathOrSubpath(const string& path, const string& parent) {
-  if (path == parent)
+  string path_key = path;
+  string parent_key = parent;
+#ifdef _WIN32
+  for (string::iterator i = path_key.begin(); i != path_key.end(); ++i) {
+    if (*i >= 'A' && *i <= 'Z')
+      *i = *i - 'A' + 'a';
+  }
+  for (string::iterator i = parent_key.begin(); i != parent_key.end(); ++i) {
+    if (*i >= 'A' && *i <= 'Z')
+      *i = *i - 'A' + 'a';
+  }
+#endif
+  if (path_key == parent_key)
     return true;
-  if (path.size() <= parent.size())
+  if (path_key.size() <= parent_key.size())
     return false;
-  return path.compare(0, parent.size(), parent) == 0 &&
-         path[parent.size()] == '/';
+  return path_key.compare(0, parent_key.size(), parent_key) == 0 &&
+         path_key[parent_key.size()] == '/';
 }
 
 bool HasStringSuffix(const string& value, const char* suffix) {
@@ -329,24 +341,6 @@ bool ShouldInferWatchDirectoryForInput(const string& path) {
   return true;
 }
 
-string AbsoluteBuildDirForWatch(const string& build_dir) {
-  string normalized_build_dir = build_dir.empty() ? "." : build_dir;
-  uint64_t slash_bits;
-  CanonicalizePath(&normalized_build_dir, &slash_bits);
-  if (IsAbsolutePathForWatch(normalized_build_dir))
-    return normalized_build_dir;
-
-  string cwd = GetWorkingDirectory();
-  if (cwd.empty())
-    return string();
-  CanonicalizePath(&cwd, &slash_bits);
-  if (normalized_build_dir == ".")
-    return cwd;
-  string absolute_build_dir = cwd + "/" + normalized_build_dir;
-  CanonicalizePath(&absolute_build_dir, &slash_bits);
-  return absolute_build_dir;
-}
-
 string AbsoluteWatchPath(const string& path) {
   string normalized_path = path.empty() ? "." : path;
   uint64_t slash_bits;
@@ -365,13 +359,28 @@ string AbsoluteWatchPath(const string& path) {
   return absolute_path;
 }
 
-bool IsDotDotRelativeWatchPath(const string& path) {
-  return path == ".." ||
-         (path.size() >= 3 && path[0] == '.' && path[1] == '.' &&
-          path[2] == '/');
+bool NormalizeDirectoryForWatch(string dir, string* normalized_dir) {
+  if (dir.empty())
+    dir = ".";
+  uint64_t slash_bits;
+  CanonicalizePath(&dir, &slash_bits);
+  // Watching the working directory itself is too noisy because Ninja updates
+  // bookkeeping files there (for example .ninja_lock and .ninja_log).
+  if (dir == ".")
+    return false;
+  *normalized_dir = dir;
+  return true;
 }
 
 void AddDirectoryForWatch(string dir, set<string>* dirs);
+
+string EffectiveBuildDirForWatch(const string& build_dir,
+                                 const string& manifest_path) {
+  string build_root = build_dir;
+  if (build_root.empty())
+    build_root = PathDirName(manifest_path);
+  return AbsoluteWatchPath(build_root);
+}
 
 void CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
     const State& state, const string& absolute_build_dir,
@@ -388,21 +397,21 @@ void CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
           !IsPathOrSubpath(absolute_output, absolute_build_dir)) {
         continue;
       }
-      AddDirectoryForWatch(PathDirName(absolute_output), generated_dirs);
+      string normalized_output_dir;
+      if (!NormalizeDirectoryForWatch(PathDirName(absolute_output),
+                                      &normalized_output_dir)) {
+        continue;
+      }
+      generated_dirs->insert(normalized_output_dir);
     }
   }
 }
 
 void AddDirectoryForWatch(string dir, set<string>* dirs) {
-  if (dir.empty())
-    dir = ".";
-  uint64_t slash_bits;
-  CanonicalizePath(&dir, &slash_bits);
-  // Watching the working directory itself is too noisy because Ninja updates
-  // bookkeeping files there (for example .ninja_lock and .ninja_log).
-  if (dir == ".")
+  string normalized_dir;
+  if (!NormalizeDirectoryForWatch(dir, &normalized_dir))
     return;
-  dirs->insert(dir);
+  dirs->insert(normalized_dir);
 }
 
 string TrimAsciiWhitespace(string input) {
@@ -415,18 +424,24 @@ string TrimAsciiWhitespace(string input) {
 
 void CollectLeafInputDirectoriesFromManifest(const State& state,
                                              const Edge* manifest_edge,
-                                             const string& build_dir,
+                                             const string& absolute_build_dir,
                                              set<string>* dirs) {
-  struct LeafInput {
+  struct DirectoryCandidate {
     string dir_path;
-    string absolute_path;
     bool under_build_dir;
+    bool has_non_generated_input;
   };
 
-  const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);
-  vector<LeafInput> leaf_inputs;
-  bool has_inferred_outside_builddir = false;
-  bool has_builddir_inputs = false;
+  set<string> generated_output_dirs_under_build_dir;
+  CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
+      state, absolute_build_dir, &generated_output_dirs_under_build_dir);
+  generated_output_dirs_under_build_dir.erase(absolute_build_dir);
+
+  bool has_parent_relative_inputs = false;
+  bool has_relative_inputs_outside_build_dir = false;
+  set<string> absolute_inputs_outside_build_dir;
+
+  map<string, DirectoryCandidate> directory_candidates;
 
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
@@ -442,49 +457,91 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
       if (!ShouldInferWatchDirectoryForInput(node->path()))
         continue;
 
-      LeafInput input;
-      input.dir_path = PathDirName(node->path());
-      input.absolute_path = AbsoluteWatchPath(node->path());
-      input.under_build_dir = !absolute_build_dir.empty() &&
-                              !input.absolute_path.empty() &&
-                              IsPathOrSubpath(input.absolute_path,
-                                              absolute_build_dir);
+      const string input_dir_path = PathDirName(node->path());
+      if (input_dir_path == ".." ||
+          (input_dir_path.size() >= 3 && input_dir_path[0] == '.' &&
+           input_dir_path[1] == '.' && input_dir_path[2] == '/')) {
+        has_parent_relative_inputs = true;
+      }
 
-      if (IsDotDotRelativeWatchPath(input.dir_path) || !input.under_build_dir)
-        has_inferred_outside_builddir = true;
-      if (input.under_build_dir)
-        has_builddir_inputs = true;
+      const string absolute_input_path = AbsoluteWatchPath(node->path());
 
-      leaf_inputs.push_back(input);
-    }
-  }
-
-  set<string> generated_output_dirs_under_build_dir;
-  if (has_builddir_inputs && has_inferred_outside_builddir) {
-    CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
-        state, absolute_build_dir, &generated_output_dirs_under_build_dir);
-  }
-
-  for (vector<LeafInput>::const_iterator i = leaf_inputs.begin();
-       i != leaf_inputs.end(); ++i) {
-    if (!i->absolute_path.empty()) {
-      Node* absolute_alias = state.LookupNode(i->absolute_path);
-      if (absolute_alias && absolute_alias->in_edge() != NULL)
-        continue;
-    }
-
-    if (has_builddir_inputs && has_inferred_outside_builddir &&
-        i->under_build_dir) {
-      string absolute_input_dir = PathDirName(i->absolute_path);
-      uint64_t slash_bits;
-      CanonicalizePath(&absolute_input_dir, &slash_bits);
-      if (generated_output_dirs_under_build_dir.find(absolute_input_dir) !=
-          generated_output_dirs_under_build_dir.end()) {
+      string normalized_dir;
+      if (!NormalizeDirectoryForWatch(input_dir_path, &normalized_dir)) {
         continue;
       }
-    }
 
-    AddDirectoryForWatch(i->dir_path, dirs);
+      string absolute_input_dir;
+      if (!absolute_input_path.empty()) {
+        absolute_input_dir = PathDirName(absolute_input_path);
+        uint64_t slash_bits;
+        CanonicalizePath(&absolute_input_dir, &slash_bits);
+      }
+
+      const bool under_build_dir = !absolute_build_dir.empty() &&
+                                   !absolute_input_dir.empty() &&
+                                   IsPathOrSubpath(absolute_input_dir,
+                                                   absolute_build_dir);
+      if (!under_build_dir && !IsAbsolutePathForWatch(node->path()))
+        has_relative_inputs_outside_build_dir = true;
+      if (!under_build_dir && IsAbsolutePathForWatch(node->path()) &&
+          !absolute_input_dir.empty()) {
+        absolute_inputs_outside_build_dir.insert(absolute_input_dir);
+      }
+
+      bool generated_only_input = false;
+      if (under_build_dir) {
+        for (set<string>::const_iterator i =
+                 generated_output_dirs_under_build_dir.begin();
+             i != generated_output_dirs_under_build_dir.end(); ++i) {
+          if (IsPathOrSubpath(absolute_input_dir, *i)) {
+            generated_only_input = true;
+            break;
+          }
+        }
+      }
+
+      string directory_key = !absolute_input_dir.empty() ?
+                                 absolute_input_dir :
+                                 normalized_dir;
+#ifdef _WIN32
+      directory_key = LowercaseASCII(directory_key);
+#endif
+
+      map<string, DirectoryCandidate>::iterator existing =
+          directory_candidates.find(directory_key);
+      if (existing == directory_candidates.end()) {
+        DirectoryCandidate candidate;
+        candidate.dir_path = normalized_dir;
+        candidate.under_build_dir = under_build_dir;
+        candidate.has_non_generated_input = !generated_only_input;
+        directory_candidates[directory_key] = candidate;
+        continue;
+      }
+
+      DirectoryCandidate* candidate = &existing->second;
+      if (IsAbsolutePathForWatch(candidate->dir_path) &&
+          !IsAbsolutePathForWatch(normalized_dir)) {
+        candidate->dir_path = normalized_dir;
+      }
+      candidate->under_build_dir = candidate->under_build_dir || under_build_dir;
+      candidate->has_non_generated_input =
+          candidate->has_non_generated_input || !generated_only_input;
+    }
+  }
+
+  for (map<string, DirectoryCandidate>::const_iterator i =
+           directory_candidates.begin();
+       i != directory_candidates.end(); ++i) {
+    const DirectoryCandidate& candidate = i->second;
+    if ((has_parent_relative_inputs ||
+         has_relative_inputs_outside_build_dir ||
+         absolute_inputs_outside_build_dir.size() > 1) &&
+        candidate.under_build_dir &&
+        !candidate.has_non_generated_input) {
+      continue;
+    }
+    dirs->insert(candidate.dir_path);
   }
 }
 
@@ -540,6 +597,7 @@ bool LoadGlobWatchfileDirectories(Edge* manifest_edge,
 
 struct DirectoryWatchCache {
   bool found = false;
+  bool compatible_version = false;
   bool has_manifest_entry = false;
   string manifest_path;
   TimeStamp manifest_mtime = 0;
@@ -556,12 +614,18 @@ bool ParseTimeStampValue(const string& value, TimeStamp* mtime) {
   return true;
 }
 
-string DirectoryWatchCachePath(const string& build_dir) {
+string DirectoryWatchCachePath(const string& build_dir,
+                               const string& manifest_path) {
   string normalized_build_dir = build_dir.empty() ? "." : build_dir;
   uint64_t slash_bits;
   CanonicalizePath(&normalized_build_dir, &slash_bits);
-  if (normalized_build_dir == ".")
-    return ".ninja_glob_dirs";
+  if (normalized_build_dir == ".") {
+    string manifest_dir = PathDirName(manifest_path);
+    CanonicalizePath(&manifest_dir, &slash_bits);
+    if (manifest_dir == ".")
+      return ".ninja_glob_dirs";
+    return manifest_dir + "/.ninja_glob_dirs";
+  }
   return normalized_build_dir + "/.ninja_glob_dirs";
 }
 
@@ -600,7 +664,7 @@ bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
     cache->found = true;
     return true;
   }
-  if (version != "ninja_glob_dirs_v2")
+  if (version != "ninja_glob_dirs_v2" && version != "ninja_glob_dirs_v3")
     return true;
 
   while (getline(in, line)) {
@@ -643,6 +707,7 @@ bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
   }
 
   cache->found = true;
+  cache->compatible_version = (version == "ninja_glob_dirs_v3");
   return true;
 }
 
@@ -651,7 +716,7 @@ bool WriteDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
                               TimeStamp manifest_mtime,
                               const set<string>& inferred_dirs,
                               const map<string, TimeStamp>& mtimes, string* err) {
-  string content = "ninja_glob_dirs_v2\n";
+  string content = "ninja_glob_dirs_v3\n";
   content.append("manifest\t");
   content.append(to_string(manifest_mtime));
   content.push_back('\t');
@@ -689,7 +754,7 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
                                          string* err) {
   *changed = false;
 
-  const string cache_path = DirectoryWatchCachePath(build_dir);
+  const string cache_path = DirectoryWatchCachePath(build_dir, manifest_path);
   DirectoryWatchCache cache;
   if (!LoadDirectoryWatchCache(disk_interface, cache_path, &cache, err))
     return false;
@@ -703,36 +768,37 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
 
   set<string> inferred_dirs;
   set<string> watched_dirs;
+  const string absolute_build_dir =
+      EffectiveBuildDirForWatch(build_dir, manifest_path);
   if (has_watchfile) {
     watched_dirs = watchfile_dirs;
   } else {
     bool reuse_cached_inferred_dirs =
-        cache.found && cache.has_manifest_entry &&
+        cache.found && cache.compatible_version && cache.has_manifest_entry &&
         cache.manifest_path == manifest_path &&
         cache.manifest_mtime == manifest_mtime;
     if (reuse_cached_inferred_dirs) {
       inferred_dirs = cache.inferred_dirs;
     } else {
-      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge, build_dir,
+      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge,
+                                              absolute_build_dir,
                                               &inferred_dirs);
     }
 
     watched_dirs = inferred_dirs;
   }
 
-  const string absolute_build_dir = AbsoluteBuildDirForWatch(build_dir);
-  for (set<string>::iterator d = watched_dirs.begin();
-       d != watched_dirs.end();) {
-    if (!absolute_build_dir.empty() && IsAbsolutePathForWatch(*d) &&
-        IsPathOrSubpath(*d, absolute_build_dir)) {
-      d = watched_dirs.erase(d);
-      continue;
+  if (has_watchfile) {
+    for (set<string>::iterator d = watched_dirs.begin();
+         d != watched_dirs.end();) {
+      if (!absolute_build_dir.empty() && IsAbsolutePathForWatch(*d) &&
+          IsPathOrSubpath(*d, absolute_build_dir)) {
+        d = watched_dirs.erase(d);
+        continue;
+      }
+      ++d;
     }
-    ++d;
   }
-
-  if (watched_dirs.empty())
-    return true;
 
   map<string, TimeStamp> current_mtimes;
   for (set<string>::const_iterator d = watched_dirs.begin();
@@ -746,13 +812,15 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
     current_mtimes[*d] = mtime;
   }
 
-  if (cache.found && cache.mtimes != current_mtimes)
+  if (cache.found && cache.mtimes != current_mtimes) {
     *changed = true;
+  }
 
-  bool cache_manifest_mismatch =
+  bool cache_manifest_mismatch = !cache.compatible_version ||
       !cache.has_manifest_entry || cache.manifest_path != manifest_path ||
       cache.manifest_mtime != manifest_mtime;
-  bool cache_inferred_dirs_mismatch = cache.inferred_dirs != inferred_dirs;
+  bool cache_inferred_dirs_mismatch =
+      !cache.compatible_version || cache.inferred_dirs != inferred_dirs;
   if (!cache.found || cache.mtimes != current_mtimes || cache_manifest_mismatch ||
       cache_inferred_dirs_mismatch) {
     if (!WriteDirectoryWatchCache(disk_interface, cache_path, manifest_path,
@@ -778,6 +846,17 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   uint64_t slash_bits;  // Unused because this path is only used for lookup.
   CanonicalizePath(&path, &slash_bits);
   Node* node = state_.LookupNode(path);
+  if (!node && IsAbsolutePathForWatch(path)) {
+    string cwd = GetWorkingDirectory();
+    if (!cwd.empty()) {
+      CanonicalizePath(&cwd, &slash_bits);
+      if (IsPathOrSubpath(path, cwd) && path.size() > cwd.size() + 1) {
+        string relative_path = path.substr(cwd.size() + 1);
+        CanonicalizePath(&relative_path, &slash_bits);
+        node = state_.LookupNode(relative_path);
+      }
+    }
+  }
   if (!node)
     return false;
 
