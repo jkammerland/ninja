@@ -193,6 +193,14 @@ class Output(unittest.TestCase):
     def _escape_ninja_path(self, path: str) -> str:
         return path.replace('$', '$$').replace(':', '$:').replace(' ', '$ ')
 
+    def _assert_single_manifest_restart(self, output: str) -> None:
+        self.assertEqual(
+            output.count(
+                'regeneration complete; restarting with updated manifest...'),
+            1)
+        self.assertEqual(output.count('Re-checking...'), 1)
+        self.assertIn('ninja: no work to do.', output)
+
     def test_issue_1418(self) -> None:
         self.assertEqual(run(
 '''rule echo
@@ -751,13 +759,16 @@ default out
                 f.write('inferred\tgen\n')
                 f.write(f'mtime\tgen\t{generated_mtime}\n')
 
+            self.assertEqual(run_in_build(), 'ninja: no work to do.\n')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('ninja_glob_dirs_v3\n', cache_content)
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
             self._create_file_and_advance_dir_mtime(source_dir, 'new.cpp')
             third = run_in_build()
-            self.assertIn('Re-checking...', third)
-            self.assertIn(
-                'regeneration complete; restarting with updated manifest...',
-                third)
-            self.assertIn('ninja: no work to do.', third)
+            self._assert_single_manifest_restart(third)
 
             with open(cache_path) as f:
                 cache_content = f.read()
@@ -816,11 +827,63 @@ default out
 
                 self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
                 third = b.run(pipe=True)
-                self.assertIn('Re-checking...', third)
-                self.assertIn(
-                    'regeneration complete; restarting with updated manifest...',
-                    third)
-                self.assertIn('ninja: no work to do.', third)
+                self._assert_single_manifest_restart(third)
+                self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+    def test_manifest_check_keeps_in_tree_source_dirs_with_absolute_inputs(
+            self) -> None:
+        # Absolute in-tree source paths should remain watched even when there
+        # are other absolute inputs outside the source tree.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build src/generated.h: phony
+build build.ninja: verify
+build out: touch ${source_input} ${external_input}
+default out
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            source_input = os.path.join(src_dir, 'a.cpp')
+            with open(source_input, 'w'):
+                pass
+
+            with tempfile.TemporaryDirectory() as ext:
+                external_input = os.path.join(ext, 'input.txt')
+                with open(external_input, 'w'):
+                    pass
+
+                with open(os.path.join(b.path, 'build.ninja'), 'r') as f:
+                    plan = f.read()
+                plan = plan.replace(
+                    '${source_input}',
+                    self._escape_ninja_path(source_input.replace('\\', '/')))
+                plan = plan.replace(
+                    '${external_input}',
+                    self._escape_ninja_path(external_input.replace('\\', '/')))
+                with open(os.path.join(b.path, 'build.ninja'), 'w') as f:
+                    f.write(plan)
+
+                self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
+                self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+                cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+                with open(cache_path) as f:
+                    cache_content = f.read()
+                source_dir_entry = src_dir.replace('\\', '/')
+                self.assertIn(f'inferred\t{source_dir_entry}\n', cache_content)
+
+                self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+                third = b.run(pipe=True)
+                self._assert_single_manifest_restart(third)
                 self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
     def test_manifest_check_in_tree_with_absolute_manifest_path(self) -> None:
@@ -863,14 +926,16 @@ default out
                 flags = f'-f {abs_manifest}'
                 self.assertEqual(b.run(flags=flags, pipe=True), '[1/1] touch out\n')
                 self.assertEqual(b.run(flags=flags, pipe=True), 'ninja: no work to do.\n')
+                cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+                self.assertTrue(os.path.exists(cache_path))
+                with open(cache_path) as f:
+                    cache_content = f.read()
+                self.assertIn('ninja_glob_dirs_v3\n', cache_content)
+                self.assertIn('inferred\tsrc\n', cache_content)
 
                 self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
                 third = b.run(flags=flags, pipe=True)
-                self.assertIn('Re-checking...', third)
-                self.assertIn(
-                    'regeneration complete; restarting with updated manifest...',
-                    third)
-                self.assertIn('ninja: no work to do.', third)
+                self._assert_single_manifest_restart(third)
                 self.assertEqual(b.run(flags=flags, pipe=True), 'ninja: no work to do.\n')
 
     def test_manifest_check_unset_builddir_uses_manifest_directory(self) -> None:

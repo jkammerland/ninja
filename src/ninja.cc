@@ -304,6 +304,11 @@ bool IsPathOrSubpath(const string& path, const string& parent) {
 #endif
   if (path_key == parent_key)
     return true;
+  if (parent_key.empty())
+    return false;
+  if (parent_key[parent_key.size() - 1] == '/')
+    return path_key.size() > parent_key.size() &&
+           path_key.compare(0, parent_key.size(), parent_key) == 0;
   if (path_key.size() <= parent_key.size())
     return false;
   return path_key.compare(0, parent_key.size(), parent_key) == 0 &&
@@ -438,8 +443,13 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
   generated_output_dirs_under_build_dir.erase(absolute_build_dir);
 
   bool has_parent_relative_inputs = false;
-  bool has_relative_inputs_outside_build_dir = false;
-  set<string> absolute_inputs_outside_build_dir;
+  bool has_inputs_outside_build_dir = false;
+  bool build_dir_is_current_working_directory = false;
+  if (!absolute_build_dir.empty()) {
+    const string absolute_cwd = AbsoluteWatchPath(".");
+    build_dir_is_current_working_directory =
+        !absolute_cwd.empty() && absolute_cwd == absolute_build_dir;
+  }
 
   map<string, DirectoryCandidate> directory_candidates;
 
@@ -465,6 +475,11 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
       }
 
       const string absolute_input_path = AbsoluteWatchPath(node->path());
+      if (!absolute_input_path.empty()) {
+        Node* absolute_alias = state.LookupNode(absolute_input_path);
+        if (absolute_alias && absolute_alias->in_edge() != NULL)
+          continue;
+      }
 
       string normalized_dir;
       if (!NormalizeDirectoryForWatch(input_dir_path, &normalized_dir)) {
@@ -482,12 +497,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
                                    !absolute_input_dir.empty() &&
                                    IsPathOrSubpath(absolute_input_dir,
                                                    absolute_build_dir);
-      if (!under_build_dir && !IsAbsolutePathForWatch(node->path()))
-        has_relative_inputs_outside_build_dir = true;
-      if (!under_build_dir && IsAbsolutePathForWatch(node->path()) &&
-          !absolute_input_dir.empty()) {
-        absolute_inputs_outside_build_dir.insert(absolute_input_dir);
-      }
+      if (!under_build_dir)
+        has_inputs_outside_build_dir = true;
 
       bool generated_only_input = false;
       if (under_build_dir) {
@@ -535,8 +546,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
        i != directory_candidates.end(); ++i) {
     const DirectoryCandidate& candidate = i->second;
     if ((has_parent_relative_inputs ||
-         has_relative_inputs_outside_build_dir ||
-         absolute_inputs_outside_build_dir.size() > 1) &&
+         (has_inputs_outside_build_dir &&
+          !build_dir_is_current_working_directory)) &&
         candidate.under_build_dir &&
         !candidate.has_non_generated_input) {
       continue;
@@ -616,16 +627,20 @@ bool ParseTimeStampValue(const string& value, TimeStamp* mtime) {
 
 string DirectoryWatchCachePath(const string& build_dir,
                                const string& manifest_path) {
-  string normalized_build_dir = build_dir.empty() ? "." : build_dir;
-  uint64_t slash_bits;
-  CanonicalizePath(&normalized_build_dir, &slash_bits);
-  if (normalized_build_dir == ".") {
+  if (build_dir.empty()) {
     string manifest_dir = PathDirName(manifest_path);
+    uint64_t slash_bits;
     CanonicalizePath(&manifest_dir, &slash_bits);
     if (manifest_dir == ".")
       return ".ninja_glob_dirs";
     return manifest_dir + "/.ninja_glob_dirs";
   }
+
+  string normalized_build_dir = build_dir;
+  uint64_t slash_bits;
+  CanonicalizePath(&normalized_build_dir, &slash_bits);
+  if (normalized_build_dir == ".")
+    return ".ninja_glob_dirs";
   return normalized_build_dir + "/.ninja_glob_dirs";
 }
 
@@ -812,7 +827,8 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
     current_mtimes[*d] = mtime;
   }
 
-  if (cache.found && cache.mtimes != current_mtimes) {
+  if (cache.found && cache.compatible_version &&
+      cache.mtimes != current_mtimes) {
     *changed = true;
   }
 
