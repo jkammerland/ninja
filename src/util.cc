@@ -1004,6 +1004,41 @@ std::string GetWorkingDirectory() {
   return ret;
 }
 
+bool MakePathRelativeTo(const string& path, const string& parent,
+                        string* relative_path) {
+  if (parent.empty())
+    return false;
+
+  string path_key = path;
+  string parent_key = parent;
+#ifdef _WIN32
+  for (string::iterator i = path_key.begin(); i != path_key.end(); ++i) {
+    if (*i >= 'A' && *i <= 'Z')
+      *i = *i - 'A' + 'a';
+  }
+  for (string::iterator i = parent_key.begin(); i != parent_key.end(); ++i) {
+    if (*i >= 'A' && *i <= 'Z')
+      *i = *i - 'A' + 'a';
+  }
+#endif
+
+  if (path_key.compare(0, parent_key.size(), parent_key) != 0)
+    return false;
+
+  size_t offset = parent_key.size();
+  if (parent_key[parent_key.size() - 1] == '/') {
+    if (path_key.size() <= offset)
+      return false;
+  } else {
+    if (path_key.size() <= offset || path_key[offset] != '/')
+      return false;
+    ++offset;
+  }
+
+  *relative_path = path.substr(offset);
+  return true;
+}
+
 bool Truncate(const string& path, size_t size, string* err) {
 #ifdef _WIN32
   int fh = _sopen(path.c_str(), _O_RDWR | _O_CREAT, _SH_DENYNO,

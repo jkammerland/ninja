@@ -105,6 +105,11 @@ double GetLoadAverage();
 /// a wrapper for getcwd()
 std::string GetWorkingDirectory();
 
+/// If |path| is a strict child of |parent|, write the relative suffix to
+/// |relative_path| and return true. Returns false otherwise.
+bool MakePathRelativeTo(const std::string& path, const std::string& parent,
+                        std::string* relative_path);
+
 /// Truncates a file to the given size.
 bool Truncate(const std::string& path, size_t size, std::string* err);
 

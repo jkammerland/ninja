@@ -158,6 +158,36 @@ TEST(CanonicalizePath, PathSamples) {
   EXPECT_EQ("foo/.._bar", path);
 }
 
+TEST(Util, MakePathRelativeTo) {
+  string relative;
+
+  EXPECT_TRUE(MakePathRelativeTo("/tmp/work/build.ninja", "/tmp/work",
+                                 &relative));
+  EXPECT_EQ("build.ninja", relative);
+
+  EXPECT_TRUE(MakePathRelativeTo("/tmp/work/build.ninja", "/tmp/work/",
+                                 &relative));
+  EXPECT_EQ("build.ninja", relative);
+
+  EXPECT_TRUE(MakePathRelativeTo("/build.ninja", "/", &relative));
+  EXPECT_EQ("build.ninja", relative);
+
+  EXPECT_FALSE(MakePathRelativeTo("/", "/", &relative));
+  EXPECT_FALSE(MakePathRelativeTo("/tmp/work", "/tmp/work", &relative));
+  EXPECT_FALSE(MakePathRelativeTo("/tmp/work", "/tmp/work2", &relative));
+
+#ifdef _WIN32
+  EXPECT_TRUE(
+      MakePathRelativeTo("C:/Tmp/Work/build.ninja", "c:/tmp/work", &relative));
+  EXPECT_EQ("build.ninja", relative);
+
+  EXPECT_TRUE(MakePathRelativeTo("C:/build.ninja", "c:/", &relative));
+  EXPECT_EQ("build.ninja", relative);
+
+  EXPECT_FALSE(MakePathRelativeTo("C:/", "c:/", &relative));
+#endif
+}
+
 #ifdef _WIN32
 TEST(CanonicalizePath, PathSamplesWindows) {
   string path;
