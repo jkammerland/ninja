@@ -1019,8 +1019,13 @@ keys.
   * optional comments starting with `#`
   * one directory path per non-empty line
 +
+  If the first non-comment entry is a `ninja_glob_watch_dirs_v*` header with
+  an unknown version, Ninja reports an error instead of treating it as a path.
++
   Ninja records and compares watched directory mtimes between runs. It
   uses directories listed by `glob_watchfile` as the authoritative watch set.
+  Relative and absolute entries are treated uniformly, including paths under
+  `builddir`.
   If `glob_watchfile` is omitted, Ninja infers watched directories from
   manifest leaf inputs.
 +

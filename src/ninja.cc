@@ -283,7 +283,9 @@ bool IsAbsolutePathForWatch(const string& path) {
   if (path[0] == '/')
     return true;
 #ifdef _WIN32
-  if (path.size() >= 3 && isalpha(path[0]) && path[1] == ':' && path[2] == '/')
+  if (path.size() >= 3 &&
+      isalpha(static_cast<unsigned char>(path[0])) &&
+      path[1] == ':' && path[2] == '/')
     return true;
 #endif
   return false;
@@ -443,13 +445,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
   generated_output_dirs_under_build_dir.erase(absolute_build_dir);
 
   bool has_parent_relative_inputs = false;
-  bool has_inputs_outside_build_dir = false;
-  bool build_dir_is_current_working_directory = false;
-  if (!absolute_build_dir.empty()) {
-    const string absolute_cwd = AbsoluteWatchPath(".");
-    build_dir_is_current_working_directory =
-        !absolute_cwd.empty() && absolute_cwd == absolute_build_dir;
-  }
+  bool has_relative_inputs_outside_build_dir = false;
+  set<string> absolute_inputs_outside_build_dir;
 
   map<string, DirectoryCandidate> directory_candidates;
 
@@ -497,8 +494,12 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
                                    !absolute_input_dir.empty() &&
                                    IsPathOrSubpath(absolute_input_dir,
                                                    absolute_build_dir);
-      if (!under_build_dir)
-        has_inputs_outside_build_dir = true;
+      if (!under_build_dir && !IsAbsolutePathForWatch(node->path()))
+        has_relative_inputs_outside_build_dir = true;
+      if (!under_build_dir && IsAbsolutePathForWatch(node->path()) &&
+          !absolute_input_dir.empty()) {
+        absolute_inputs_outside_build_dir.insert(absolute_input_dir);
+      }
 
       bool generated_only_input = false;
       if (under_build_dir) {
@@ -546,8 +547,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
        i != directory_candidates.end(); ++i) {
     const DirectoryCandidate& candidate = i->second;
     if ((has_parent_relative_inputs ||
-         (has_inputs_outside_build_dir &&
-          !build_dir_is_current_working_directory)) &&
+         has_relative_inputs_outside_build_dir ||
+         absolute_inputs_outside_build_dir.size() > 1) &&
         candidate.under_build_dir &&
         !candidate.has_non_generated_input) {
       continue;
@@ -556,19 +557,28 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
   }
 }
 
-bool ParseWatchDirectoryFile(const string& content, set<string>* dirs) {
+bool ParseWatchDirectoryFile(const string& content, set<string>* dirs,
+                             string* err) {
+  static const char kWatchfileVersionPrefix[] = "ninja_glob_watch_dirs_v";
   istringstream in(content);
   string line;
-  bool has_header = false;
+  bool saw_entry = false;
   while (getline(in, line)) {
     const string trimmed = TrimAsciiWhitespace(line);
     if (trimmed.empty() || trimmed[0] == '#')
       continue;
-    if (!has_header && trimmed == "ninja_glob_watch_dirs_v1") {
-      has_header = true;
+    if (!saw_entry &&
+        trimmed.compare(0, sizeof(kWatchfileVersionPrefix) - 1,
+                        kWatchfileVersionPrefix) == 0) {
+      if (trimmed != "ninja_glob_watch_dirs_v1") {
+        *err = "unsupported glob watch file schema '" + trimmed + "'";
+        return false;
+      }
+      saw_entry = true;
       continue;
     }
 
+    saw_entry = true;
     string path = trimmed;
     AddDirectoryForWatch(path, dirs);
   }
@@ -603,18 +613,39 @@ bool LoadGlobWatchfileDirectories(Edge* manifest_edge,
     return false;
   }
 
-  return ParseWatchDirectoryFile(watchfile_content, dirs);
+  if (!ParseWatchDirectoryFile(watchfile_content, dirs, err)) {
+    *err = "parsing glob watch file '" + watchfile + "': " + *err;
+    return false;
+  }
+  return true;
 }
 
 struct DirectoryWatchCache {
   bool found = false;
+  int version = 0;
   bool compatible_version = false;
+  bool future_version = false;
   bool has_manifest_entry = false;
   string manifest_path;
   TimeStamp manifest_mtime = 0;
   set<string> inferred_dirs;
   map<string, TimeStamp> mtimes;
 };
+
+bool ParseDirectoryWatchCacheVersion(const string& version, int* parsed_version) {
+  static const char kPrefix[] = "ninja_glob_dirs_v";
+  if (version.compare(0, sizeof(kPrefix) - 1, kPrefix) != 0)
+    return false;
+  const char* suffix = version.c_str() + (sizeof(kPrefix) - 1);
+  if (*suffix == '\0')
+    return false;
+  char* end = NULL;
+  long parsed = strtol(suffix, &end, 10);
+  if (!end || *end != '\0' || parsed <= 0 || parsed > INT_MAX)
+    return false;
+  *parsed_version = static_cast<int>(parsed);
+  return true;
+}
 
 bool ParseTimeStampValue(const string& value, TimeStamp* mtime) {
   char* end = NULL;
@@ -644,6 +675,10 @@ string DirectoryWatchCachePath(const string& build_dir,
   return normalized_build_dir + "/.ninja_glob_dirs";
 }
 
+string DirectoryWatchCompatCachePath(const string& cache_path) {
+  return cache_path + ".compat_v3";
+}
+
 bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
                              DirectoryWatchCache* cache,
                              string* err) {
@@ -662,7 +697,16 @@ bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
   if (!getline(in, line))
     return true;
   const string version = TrimAsciiWhitespace(line);
-  if (version == "ninja_glob_dirs_v1") {
+  int parsed_version = 0;
+  if (!ParseDirectoryWatchCacheVersion(version, &parsed_version))
+    return true;
+
+  cache->found = true;
+  cache->version = parsed_version;
+  cache->compatible_version = (parsed_version == 3);
+  cache->future_version = (parsed_version > 3);
+
+  if (parsed_version == 1) {
     while (getline(in, line)) {
       if (line.empty())
         continue;
@@ -676,11 +720,8 @@ bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
         continue;
       cache->mtimes[key] = mtime;
     }
-    cache->found = true;
     return true;
   }
-  if (version != "ninja_glob_dirs_v2" && version != "ninja_glob_dirs_v3")
-    return true;
 
   while (getline(in, line)) {
     if (line.empty())
@@ -720,9 +761,6 @@ bool LoadDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
       continue;
     }
   }
-
-  cache->found = true;
-  cache->compatible_version = (version == "ninja_glob_dirs_v3");
   return true;
 }
 
@@ -760,6 +798,98 @@ bool WriteDirectoryWatchCache(DiskInterface* disk_interface, const string& path,
   return true;
 }
 
+bool PrepareDirectoryWatchCacheForReadWrite(DiskInterface* disk_interface,
+                                            const string& cache_path,
+                                            DirectoryWatchCache* cache,
+                                            string* writable_cache_path,
+                                            string* err) {
+  DirectoryWatchCache loaded_cache;
+  if (!LoadDirectoryWatchCache(disk_interface, cache_path, &loaded_cache, err))
+    return false;
+
+  *cache = loaded_cache;
+  *writable_cache_path = cache_path;
+  if (!loaded_cache.future_version)
+    return true;
+
+  const string compat_cache_path = DirectoryWatchCompatCachePath(cache_path);
+  DirectoryWatchCache compat_cache;
+  if (!LoadDirectoryWatchCache(disk_interface, compat_cache_path, &compat_cache,
+                               err)) {
+    return false;
+  }
+
+  bool compat_matches_loaded_cache =
+      compat_cache.found && compat_cache.compatible_version &&
+      compat_cache.has_manifest_entry == loaded_cache.has_manifest_entry &&
+      compat_cache.manifest_path == loaded_cache.manifest_path &&
+      compat_cache.manifest_mtime == loaded_cache.manifest_mtime &&
+      compat_cache.inferred_dirs == loaded_cache.inferred_dirs;
+  if (!compat_matches_loaded_cache) {
+    if (!WriteDirectoryWatchCache(disk_interface, compat_cache_path,
+                                  loaded_cache.manifest_path,
+                                  loaded_cache.manifest_mtime,
+                                  loaded_cache.inferred_dirs,
+                                  loaded_cache.mtimes, err)) {
+      return false;
+    }
+    if (!LoadDirectoryWatchCache(disk_interface, compat_cache_path,
+                                 &compat_cache, err)) {
+      return false;
+    }
+  }
+
+  *cache = compat_cache;
+  *writable_cache_path = compat_cache_path;
+  return true;
+}
+
+void ComputeManifestWatchedDirectories(const State& state, Edge* manifest_edge,
+                                       const string& absolute_build_dir,
+                                       const string& manifest_path,
+                                       TimeStamp manifest_mtime,
+                                       const DirectoryWatchCache& cache,
+                                       const set<string>& watchfile_dirs,
+                                       bool has_watchfile,
+                                       set<string>* inferred_dirs,
+                                       set<string>* watched_dirs) {
+  if (has_watchfile) {
+    *watched_dirs = watchfile_dirs;
+    return;
+  }
+
+  bool can_reuse_cached_inferred_dirs =
+      cache.found && cache.compatible_version && cache.has_manifest_entry &&
+      cache.manifest_path == manifest_path &&
+      cache.manifest_mtime == manifest_mtime;
+  if (can_reuse_cached_inferred_dirs) {
+    *inferred_dirs = cache.inferred_dirs;
+  } else {
+    CollectLeafInputDirectoriesFromManifest(state, manifest_edge,
+                                            absolute_build_dir,
+                                            inferred_dirs);
+  }
+
+  *watched_dirs = *inferred_dirs;
+}
+
+bool StatManifestWatchedDirectories(DiskInterface* disk_interface,
+                                    const set<string>& watched_dirs,
+                                    map<string, TimeStamp>* mtimes,
+                                    string* err) {
+  for (set<string>::const_iterator d = watched_dirs.begin();
+       d != watched_dirs.end(); ++d) {
+    string stat_err;
+    TimeStamp mtime = disk_interface->Stat(*d, &stat_err);
+    if (mtime < 0) {
+      *err = "stat(" + *d + "): " + stat_err;
+      return false;
+    }
+    (*mtimes)[*d] = mtime;
+  }
+  return true;
+}
+
 bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
                                          DiskInterface* disk_interface,
                                          const string& build_dir,
@@ -771,8 +901,12 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
 
   const string cache_path = DirectoryWatchCachePath(build_dir, manifest_path);
   DirectoryWatchCache cache;
-  if (!LoadDirectoryWatchCache(disk_interface, cache_path, &cache, err))
+  string writable_cache_path;
+  if (!PrepareDirectoryWatchCacheForReadWrite(disk_interface, cache_path,
+                                              &cache, &writable_cache_path,
+                                              err)) {
     return false;
+  }
 
   set<string> watchfile_dirs;
   bool has_watchfile = false;
@@ -785,46 +919,15 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
   set<string> watched_dirs;
   const string absolute_build_dir =
       EffectiveBuildDirForWatch(build_dir, manifest_path);
-  if (has_watchfile) {
-    watched_dirs = watchfile_dirs;
-  } else {
-    bool reuse_cached_inferred_dirs =
-        cache.found && cache.compatible_version && cache.has_manifest_entry &&
-        cache.manifest_path == manifest_path &&
-        cache.manifest_mtime == manifest_mtime;
-    if (reuse_cached_inferred_dirs) {
-      inferred_dirs = cache.inferred_dirs;
-    } else {
-      CollectLeafInputDirectoriesFromManifest(*state, manifest_edge,
-                                              absolute_build_dir,
-                                              &inferred_dirs);
-    }
-
-    watched_dirs = inferred_dirs;
-  }
-
-  if (has_watchfile) {
-    for (set<string>::iterator d = watched_dirs.begin();
-         d != watched_dirs.end();) {
-      if (!absolute_build_dir.empty() && IsAbsolutePathForWatch(*d) &&
-          IsPathOrSubpath(*d, absolute_build_dir)) {
-        d = watched_dirs.erase(d);
-        continue;
-      }
-      ++d;
-    }
-  }
+  ComputeManifestWatchedDirectories(*state, manifest_edge, absolute_build_dir,
+                                    manifest_path, manifest_mtime, cache,
+                                    watchfile_dirs, has_watchfile,
+                                    &inferred_dirs, &watched_dirs);
 
   map<string, TimeStamp> current_mtimes;
-  for (set<string>::const_iterator d = watched_dirs.begin();
-       d != watched_dirs.end(); ++d) {
-    string stat_err;
-    TimeStamp mtime = disk_interface->Stat(*d, &stat_err);
-    if (mtime < 0) {
-      *err = "stat(" + *d + "): " + stat_err;
-      return false;
-    }
-    current_mtimes[*d] = mtime;
+  if (!StatManifestWatchedDirectories(disk_interface, watched_dirs,
+                                      &current_mtimes, err)) {
+    return false;
   }
 
   if (cache.found && cache.compatible_version &&
@@ -837,9 +940,12 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
       cache.manifest_mtime != manifest_mtime;
   bool cache_inferred_dirs_mismatch =
       !cache.compatible_version || cache.inferred_dirs != inferred_dirs;
-  if (!cache.found || cache.mtimes != current_mtimes || cache_manifest_mismatch ||
-      cache_inferred_dirs_mismatch) {
-    if (!WriteDirectoryWatchCache(disk_interface, cache_path, manifest_path,
+  bool should_write_cache =
+      (!cache.found || cache.mtimes != current_mtimes ||
+       cache_manifest_mismatch || cache_inferred_dirs_mismatch);
+  if (should_write_cache) {
+    if (!WriteDirectoryWatchCache(disk_interface, writable_cache_path,
+                                  manifest_path,
                                   manifest_mtime, inferred_dirs, current_mtimes,
                                   err)) {
       return false;
@@ -866,8 +972,8 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
     string cwd = GetWorkingDirectory();
     if (!cwd.empty()) {
       CanonicalizePath(&cwd, &slash_bits);
-      if (IsPathOrSubpath(path, cwd) && path.size() > cwd.size() + 1) {
-        string relative_path = path.substr(cwd.size() + 1);
+      string relative_path;
+      if (MakePathRelativeTo(path, cwd, &relative_path)) {
         CanonicalizePath(&relative_path, &slash_bits);
         node = state_.LookupNode(relative_path);
       }
@@ -2490,14 +2596,18 @@ NORETURN void real_main(int argc, char** argv) {
       // manifest forever. Better to return immediately.
       if (config.dry_run)
         exit(0);
-      status->Info("regeneration complete; restarting with updated manifest...");
+      if (config.verbosity != BuildConfig::NO_STATUS_UPDATE) {
+        status->Info("regeneration complete; restarting with updated manifest...");
+      }
       // Start the build over with the new manifest.
       continue;
     } else if (!err.empty()) {
       status->Error("rebuilding '%s': %s", options.input_file, err.c_str());
       exit(1);
     } else if (manifest_phase_ran) {
-      status->Info("manifest check complete; building requested targets...");
+      if (config.verbosity != BuildConfig::NO_STATUS_UPDATE) {
+        status->Info("manifest check complete; building requested targets...");
+      }
     }
 
     ninja.ParsePreviousElapsedTimes();
