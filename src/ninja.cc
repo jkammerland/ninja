@@ -819,6 +819,9 @@ bool PrepareDirectoryWatchCacheForReadWrite(DiskInterface* disk_interface,
     return false;
   }
 
+  // The primary cache may use an unknown future schema and cannot be updated by
+  // this Ninja version. Keep compat mtimes independent once seeded; only
+  // reseed when manifest identity or inferred directory set changes.
   bool compat_matches_loaded_cache =
       compat_cache.found && compat_cache.compatible_version &&
       compat_cache.has_manifest_entry == loaded_cache.has_manifest_entry &&
@@ -1018,6 +1021,21 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   *manifest_phase_ran = true;
   if (builder.Build(err) != ExitSuccess)
     return false;
+
+  string post_manifest_stat_err;
+  TimeStamp post_manifest_mtime = disk_interface_.Stat(path,
+                                                       &post_manifest_stat_err);
+  if (post_manifest_mtime < 0) {
+    *err = "stat(" + path + "): " + post_manifest_stat_err;
+    return false;
+  }
+  bool post_build_watch_changed = false;
+  if (!ComputeManifestDirectoryWatchChange(&state_, node->in_edge(),
+                                           &disk_interface_, build_dir_, path,
+                                           post_manifest_mtime,
+                                           &post_build_watch_changed, err)) {
+    return false;
+  }
 
   // The manifest was only rebuilt if it is now dirty (it may have been cleaned
   // by a restat).

@@ -1176,6 +1176,58 @@ default out
             self.assertNotIn('COPY out', third)
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
+    def test_manifest_check_no_regen_loop_when_regen_touches_build_local_dir(
+            self) -> None:
+        # If a manifest regeneration run mutates a watched build-local
+        # directory, Ninja should still perform at most one manifest restart.
+        with tempfile.TemporaryDirectory() as root:
+            build_dir = os.path.join(root, 'build')
+            os.mkdir(build_dir)
+            generated_dir = os.path.join(build_dir, 'gen')
+            os.mkdir(generated_dir)
+            with open(os.path.join(generated_dir, 'generated.cpp'), 'w'):
+                pass
+
+            with tempfile.TemporaryDirectory() as ext:
+                external_input = os.path.join(ext, 'input.txt')
+                with open(external_input, 'w'):
+                    pass
+
+                py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
+                ext_input = self._escape_ninja_path(
+                    external_input.replace('\\', '/'))
+                with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
+                    f.write(dedent(f'''\
+builddir = .
+
+rule verify
+  command = touch $out && {py} -c "import pathlib,time; d = pathlib.Path('gen'); d.mkdir(exist_ok=True); (d / ('stamp_' + str(time.time_ns()))).write_text('')"
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build gen/generated.h: phony
+build build.ninja: verify
+build out: touch gen/generated.cpp {ext_input}
+default out
+'''))
+
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), '[1/1] touch out\n')
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
+                self._create_file_and_advance_dir_mtime(ext, 'new.cpp')
+                third = self._run_ninja_in_dir(build_dir)
+                self._assert_single_manifest_restart(third)
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
     def test_manifest_check_with_glob_watchfile(self) -> None:
         # A generator can explicitly declare watched directories through
         # glob_watchfile bindings.
