@@ -438,12 +438,14 @@ struct DirectoryCandidate {
 struct DirectoryInferenceState {
   bool has_parent_relative_inputs;
   bool has_relative_inputs_outside_build_dir;
+  bool drop_generated_only_for_multiple_absolute_inputs;
   set<string> absolute_inputs_outside_build_dir;
   map<string, DirectoryCandidate> candidates;
 
   DirectoryInferenceState()
       : has_parent_relative_inputs(false),
-        has_relative_inputs_outside_build_dir(false) {}
+        has_relative_inputs_outside_build_dir(false),
+        drop_generated_only_for_multiple_absolute_inputs(false) {}
 };
 
 bool IsParentRelativeInputDirectoryForWatch(const string& input_dir_path) {
@@ -548,13 +550,15 @@ bool ShouldDropDirectoryCandidateForWatch(
   bool mixed_source_layout =
       inference.has_parent_relative_inputs ||
       inference.has_relative_inputs_outside_build_dir ||
-      inference.absolute_inputs_outside_build_dir.size() > 1;
+      (inference.drop_generated_only_for_multiple_absolute_inputs &&
+       inference.absolute_inputs_outside_build_dir.size() > 1);
   return mixed_source_layout && candidate.under_build_dir &&
          !candidate.has_non_generated_input;
 }
 
 void CollectLeafInputDirectoriesFromManifest(const State& state,
                                              const Edge* manifest_edge,
+                                             bool has_explicit_build_dir,
                                              const string& absolute_build_dir,
                                              set<string>* dirs) {
   set<string> generated_output_dirs_under_build_dir;
@@ -563,6 +567,8 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
   generated_output_dirs_under_build_dir.erase(absolute_build_dir);
 
   DirectoryInferenceState inference;
+  inference.drop_generated_only_for_multiple_absolute_inputs =
+      has_explicit_build_dir;
 
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
@@ -911,6 +917,7 @@ bool PrepareDirectoryWatchCacheForReadWrite(DiskInterface* disk_interface,
 
 void ComputeManifestWatchedDirectories(const State& state, Edge* manifest_edge,
                                        const string& absolute_build_dir,
+                                       bool has_explicit_build_dir,
                                        const string& manifest_path,
                                        TimeStamp manifest_mtime,
                                        const DirectoryWatchCache& cache,
@@ -931,6 +938,7 @@ void ComputeManifestWatchedDirectories(const State& state, Edge* manifest_edge,
     *inferred_dirs = cache.inferred_dirs;
   } else {
     CollectLeafInputDirectoriesFromManifest(state, manifest_edge,
+                                            has_explicit_build_dir,
                                             absolute_build_dir,
                                             inferred_dirs);
   }
@@ -985,8 +993,9 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
   const string absolute_build_dir =
       EffectiveBuildDirForWatch(build_dir, manifest_path);
   ComputeManifestWatchedDirectories(*state, manifest_edge, absolute_build_dir,
-                                    manifest_path, manifest_mtime, cache,
-                                    watchfile_dirs, has_watchfile,
+                                    !build_dir.empty(), manifest_path,
+                                    manifest_mtime, cache, watchfile_dirs,
+                                    has_watchfile,
                                     &inferred_dirs, &watched_dirs);
 
   map<string, TimeStamp> current_mtimes;

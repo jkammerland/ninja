@@ -1030,6 +1030,63 @@ default out
                 self._assert_single_manifest_restart(third)
                 self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
+    def test_manifest_check_keeps_in_tree_source_dirs_with_multiple_absolute_inputs(
+            self) -> None:
+        # Multiple absolute external inputs should not cause in-tree source
+        # directories to be pruned from inferred watches.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build src/generated.h: phony
+build build.ninja: verify
+build out: touch src/a.cpp ${external_input_a} ${external_input_b}
+default out
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            with tempfile.TemporaryDirectory() as ext_a, tempfile.TemporaryDirectory() as ext_b:
+                external_input_a = os.path.join(ext_a, 'a.txt')
+                external_input_b = os.path.join(ext_b, 'b.txt')
+                with open(external_input_a, 'w'):
+                    pass
+                with open(external_input_b, 'w'):
+                    pass
+
+                with open(os.path.join(b.path, 'build.ninja'), 'r') as f:
+                    plan = f.read()
+                plan = plan.replace(
+                    '${external_input_a}',
+                    self._escape_ninja_path(external_input_a.replace('\\', '/')))
+                plan = plan.replace(
+                    '${external_input_b}',
+                    self._escape_ninja_path(external_input_b.replace('\\', '/')))
+                with open(os.path.join(b.path, 'build.ninja'), 'w') as f:
+                    f.write(plan)
+
+                self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
+                self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+                cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+                with open(cache_path) as f:
+                    cache_content = f.read()
+                self.assertIn('inferred\tsrc\n', cache_content)
+
+                self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+                third = b.run(pipe=True)
+                self._assert_single_manifest_restart(third)
+                self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
     def test_manifest_check_in_tree_with_absolute_manifest_path(self) -> None:
         # Absolute -f paths should not change inferred-watch semantics.
         with BuildDir('''rule verify
@@ -1314,6 +1371,120 @@ default a.o
                           fourth)
             self.assertIn('ninja: no work to do.', fourth)
             self.assertNotIn('CXX a.o', fourth)
+
+    def test_manifest_check_with_glob_watchfile_ignores_dot_entry(self) -> None:
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule cc
+  command = touch $out
+  description = CXX $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build a.o: cc src/a.cpp
+default a.o
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            watched = os.path.join(b.path, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('.\n')
+                f.write('watched\n')
+
+            self.assertEqual(b.run(pipe=True), '[1/1] CXX a.o\n')
+
+            cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertNotIn('mtime\t.\t', cache_content)
+            self.assertIn('mtime\twatched\t', cache_content)
+
+            self._create_file_and_advance_dir_mtime(b.path, 'watch_trigger.txt')
+            third = b.run(pipe=True)
+            self.assertEqual(third, 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(watched, 'entry.txt')
+            fourth = b.run(pipe=True)
+            self.assertIn('Re-checking...', fourth)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+
+    def test_manifest_check_explicit_builddir_prunes_generated_only_dirs_with_multiple_absolutes(
+            self) -> None:
+        # With explicit builddir and multiple absolute source roots, keep
+        # generated-only build-local dirs out of inferred watches.
+        with tempfile.TemporaryDirectory() as root:
+            build_dir = os.path.join(root, 'build')
+            generated_dir = os.path.join(build_dir, 'gen')
+            os.mkdir(build_dir)
+            os.mkdir(generated_dir)
+            with open(os.path.join(generated_dir, 'generated.cpp'), 'w'):
+                pass
+
+            with tempfile.TemporaryDirectory() as ext_a, tempfile.TemporaryDirectory() as ext_b:
+                ext_a_dir = os.path.join(ext_a, 'src')
+                ext_b_dir = os.path.join(ext_b, 'src')
+                os.mkdir(ext_a_dir)
+                os.mkdir(ext_b_dir)
+                ext_a_input = os.path.join(ext_a_dir, 'a.cpp')
+                ext_b_input = os.path.join(ext_b_dir, 'b.cpp')
+                with open(ext_a_input, 'w'):
+                    pass
+                with open(ext_b_input, 'w'):
+                    pass
+
+                with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
+                    f.write(dedent(f'''\
+builddir = .
+
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build gen/generated.h: phony
+build build.ninja: verify
+build out: touch gen/generated.cpp {self._escape_ninja_path(ext_a_input.replace('\\\\', '/'))} {self._escape_ninja_path(ext_b_input.replace('\\\\', '/'))}
+default out
+'''))
+
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), '[1/1] touch out\n')
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
+                cache_path = os.path.join(build_dir, '.ninja_glob_dirs')
+                with open(cache_path) as f:
+                    cache_content = f.read()
+                self.assertNotIn('inferred\tgen\n', cache_content)
+
+                self._create_file_and_advance_dir_mtime(generated_dir, 'new.cpp')
+                self.assertEqual(
+                    self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
+                self._create_file_and_advance_dir_mtime(ext_a_dir, 'new.cpp')
+                fourth = self._run_ninja_in_dir(build_dir)
+                self.assertIn('Re-checking...', fourth)
+                self.assertIn('regeneration complete; restarting with updated manifest...',
+                              fourth)
+                self.assertIn('ninja: no work to do.', fourth)
 
     def test_manifest_check_missing_glob_watchfile(self) -> None:
         with BuildDir('''rule verify
@@ -2015,7 +2186,8 @@ build stamp-2: touch || dd-2
             run(plan, '-v', print_err_output=False)
         actual = cm.exception.cooked_output
         self.assertEqual(cm.exception.returncode, 1)
-        self.assertIn(r"[1/4] printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1", actual)
+        # dd-1 and dd-2 are both ready initially; scheduler order is not stable.
+        self.assertIn(r"printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1", actual)
         self.assertIn(r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2", actual)
         self.assertTrue(actual.endswith("ninja: build stopped: multiple rules generate out.\n"))
 

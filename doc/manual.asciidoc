@@ -1026,6 +1026,8 @@ keys.
   uses directories listed by `glob_watchfile` as the authoritative watch set.
   Relative and absolute entries are treated uniformly, including paths under
   `builddir`.
+  Entries that canonicalize to `.` are ignored to avoid self-triggering on
+  Ninja bookkeeping files in the working directory.
   If `glob_watchfile` is omitted, Ninja infers watched directories from
   manifest leaf inputs.
 +
