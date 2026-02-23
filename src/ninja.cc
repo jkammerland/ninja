@@ -429,26 +429,140 @@ string TrimAsciiWhitespace(string input) {
   return input.substr(start, end - start + 1);
 }
 
+struct DirectoryCandidate {
+  string dir_path;
+  bool under_build_dir;
+  bool has_non_generated_input;
+};
+
+struct DirectoryInferenceState {
+  bool has_parent_relative_inputs;
+  bool has_relative_inputs_outside_build_dir;
+  set<string> absolute_inputs_outside_build_dir;
+  map<string, DirectoryCandidate> candidates;
+
+  DirectoryInferenceState()
+      : has_parent_relative_inputs(false),
+        has_relative_inputs_outside_build_dir(false) {}
+};
+
+bool IsParentRelativeInputDirectoryForWatch(const string& input_dir_path) {
+  return input_dir_path == ".." ||
+         (input_dir_path.size() >= 3 && input_dir_path[0] == '.' &&
+          input_dir_path[1] == '.' && input_dir_path[2] == '/');
+}
+
+bool IsInputNodeEligibleForWatchInference(const Node* node) {
+  if (node->in_edge() != NULL)
+    return false;
+  if (node->generated_by_dep_loader())
+    return false;
+  return ShouldInferWatchDirectoryForInput(node->path());
+}
+
+bool ResolveAbsoluteInputDirectoryForWatch(const string& input_path,
+                                           string* absolute_input_path,
+                                           string* absolute_input_dir) {
+  *absolute_input_path = AbsoluteWatchPath(input_path);
+  if (absolute_input_path->empty())
+    return false;
+  *absolute_input_dir = PathDirName(*absolute_input_path);
+  uint64_t slash_bits;
+  CanonicalizePath(absolute_input_dir, &slash_bits);
+  return true;
+}
+
+bool IsInputDirectoryUnderBuildDirForWatch(const string& absolute_input_dir,
+                                           const string& absolute_build_dir) {
+  return !absolute_build_dir.empty() && !absolute_input_dir.empty() &&
+         IsPathOrSubpath(absolute_input_dir, absolute_build_dir);
+}
+
+void UpdateDirectoryInferenceScopeFlags(const string& input_path,
+                                        const string& input_dir_path,
+                                        bool under_build_dir,
+                                        const string& absolute_input_dir,
+                                        DirectoryInferenceState* inference) {
+  if (IsParentRelativeInputDirectoryForWatch(input_dir_path))
+    inference->has_parent_relative_inputs = true;
+  if (!under_build_dir && !IsAbsolutePathForWatch(input_path))
+    inference->has_relative_inputs_outside_build_dir = true;
+  if (!under_build_dir && IsAbsolutePathForWatch(input_path) &&
+      !absolute_input_dir.empty()) {
+    inference->absolute_inputs_outside_build_dir.insert(absolute_input_dir);
+  }
+}
+
+bool IsGeneratedOnlyInputDirectoryForWatch(
+    const string& absolute_input_dir,
+    const set<string>& generated_output_dirs_under_build_dir) {
+  for (set<string>::const_iterator i =
+           generated_output_dirs_under_build_dir.begin();
+       i != generated_output_dirs_under_build_dir.end(); ++i) {
+    if (IsPathOrSubpath(absolute_input_dir, *i))
+      return true;
+  }
+  return false;
+}
+
+string DirectoryCandidateKeyForWatch(const string& absolute_input_dir,
+                                     const string& normalized_dir) {
+  string directory_key =
+      !absolute_input_dir.empty() ? absolute_input_dir : normalized_dir;
+#ifdef _WIN32
+  directory_key = LowercaseASCII(directory_key);
+#endif
+  return directory_key;
+}
+
+void MergeDirectoryCandidateForWatch(
+    const string& directory_key, const string& normalized_dir,
+    bool under_build_dir, bool generated_only_input,
+    map<string, DirectoryCandidate>* candidates) {
+  map<string, DirectoryCandidate>::iterator existing =
+      candidates->find(directory_key);
+  if (existing == candidates->end()) {
+    DirectoryCandidate candidate;
+    candidate.dir_path = normalized_dir;
+    candidate.under_build_dir = under_build_dir;
+    candidate.has_non_generated_input = !generated_only_input;
+    (*candidates)[directory_key] = candidate;
+    return;
+  }
+
+  DirectoryCandidate* candidate = &existing->second;
+  if (IsAbsolutePathForWatch(candidate->dir_path) &&
+      !IsAbsolutePathForWatch(normalized_dir)) {
+    candidate->dir_path = normalized_dir;
+  }
+  candidate->under_build_dir = candidate->under_build_dir || under_build_dir;
+  candidate->has_non_generated_input =
+      candidate->has_non_generated_input || !generated_only_input;
+}
+
+bool ShouldDropDirectoryCandidateForWatch(
+    const DirectoryInferenceState& inference,
+    const DirectoryCandidate& candidate) {
+  // In mixed-source layouts, build-local generated-only directories are noisy
+  // and should not trigger manifest-check reruns.
+  bool mixed_source_layout =
+      inference.has_parent_relative_inputs ||
+      inference.has_relative_inputs_outside_build_dir ||
+      inference.absolute_inputs_outside_build_dir.size() > 1;
+  return mixed_source_layout && candidate.under_build_dir &&
+         !candidate.has_non_generated_input;
+}
+
 void CollectLeafInputDirectoriesFromManifest(const State& state,
                                              const Edge* manifest_edge,
                                              const string& absolute_build_dir,
                                              set<string>* dirs) {
-  struct DirectoryCandidate {
-    string dir_path;
-    bool under_build_dir;
-    bool has_non_generated_input;
-  };
-
   set<string> generated_output_dirs_under_build_dir;
   CollectGeneratedOutputDirectoriesUnderBuildDirForWatch(
       state, absolute_build_dir, &generated_output_dirs_under_build_dir);
   generated_output_dirs_under_build_dir.erase(absolute_build_dir);
 
-  bool has_parent_relative_inputs = false;
-  bool has_relative_inputs_outside_build_dir = false;
-  set<string> absolute_inputs_outside_build_dir;
-
-  map<string, DirectoryCandidate> directory_candidates;
+  DirectoryInferenceState inference;
 
   for (vector<Edge*>::const_iterator e = state.edges_.begin();
        e != state.edges_.end(); ++e) {
@@ -457,22 +571,14 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
     for (vector<Node*>::const_iterator i = (*e)->inputs_.begin();
          i != (*e)->inputs_.end(); ++i) {
       Node* node = *i;
-      if (node->in_edge() != NULL)
-        continue;
-      if (node->generated_by_dep_loader())
-        continue;
-      if (!ShouldInferWatchDirectoryForInput(node->path()))
+      if (!IsInputNodeEligibleForWatchInference(node))
         continue;
 
       const string input_dir_path = PathDirName(node->path());
-      if (input_dir_path == ".." ||
-          (input_dir_path.size() >= 3 && input_dir_path[0] == '.' &&
-           input_dir_path[1] == '.' && input_dir_path[2] == '/')) {
-        has_parent_relative_inputs = true;
-      }
-
-      const string absolute_input_path = AbsoluteWatchPath(node->path());
-      if (!absolute_input_path.empty()) {
+      string absolute_input_path;
+      string absolute_input_dir;
+      if (ResolveAbsoluteInputDirectoryForWatch(
+              node->path(), &absolute_input_path, &absolute_input_dir)) {
         Node* absolute_alias = state.LookupNode(absolute_input_path);
         if (absolute_alias && absolute_alias->in_edge() != NULL)
           continue;
@@ -483,76 +589,32 @@ void CollectLeafInputDirectoriesFromManifest(const State& state,
         continue;
       }
 
-      string absolute_input_dir;
-      if (!absolute_input_path.empty()) {
-        absolute_input_dir = PathDirName(absolute_input_path);
-        uint64_t slash_bits;
-        CanonicalizePath(&absolute_input_dir, &slash_bits);
-      }
-
-      const bool under_build_dir = !absolute_build_dir.empty() &&
-                                   !absolute_input_dir.empty() &&
-                                   IsPathOrSubpath(absolute_input_dir,
-                                                   absolute_build_dir);
-      if (!under_build_dir && !IsAbsolutePathForWatch(node->path()))
-        has_relative_inputs_outside_build_dir = true;
-      if (!under_build_dir && IsAbsolutePathForWatch(node->path()) &&
-          !absolute_input_dir.empty()) {
-        absolute_inputs_outside_build_dir.insert(absolute_input_dir);
-      }
+      const bool under_build_dir = IsInputDirectoryUnderBuildDirForWatch(
+          absolute_input_dir, absolute_build_dir);
+      UpdateDirectoryInferenceScopeFlags(node->path(), input_dir_path,
+                                         under_build_dir, absolute_input_dir,
+                                         &inference);
 
       bool generated_only_input = false;
       if (under_build_dir) {
-        for (set<string>::const_iterator i =
-                 generated_output_dirs_under_build_dir.begin();
-             i != generated_output_dirs_under_build_dir.end(); ++i) {
-          if (IsPathOrSubpath(absolute_input_dir, *i)) {
-            generated_only_input = true;
-            break;
-          }
-        }
+        generated_only_input = IsGeneratedOnlyInputDirectoryForWatch(
+            absolute_input_dir, generated_output_dirs_under_build_dir);
       }
 
-      string directory_key = !absolute_input_dir.empty() ?
-                                 absolute_input_dir :
-                                 normalized_dir;
-#ifdef _WIN32
-      directory_key = LowercaseASCII(directory_key);
-#endif
-
-      map<string, DirectoryCandidate>::iterator existing =
-          directory_candidates.find(directory_key);
-      if (existing == directory_candidates.end()) {
-        DirectoryCandidate candidate;
-        candidate.dir_path = normalized_dir;
-        candidate.under_build_dir = under_build_dir;
-        candidate.has_non_generated_input = !generated_only_input;
-        directory_candidates[directory_key] = candidate;
-        continue;
-      }
-
-      DirectoryCandidate* candidate = &existing->second;
-      if (IsAbsolutePathForWatch(candidate->dir_path) &&
-          !IsAbsolutePathForWatch(normalized_dir)) {
-        candidate->dir_path = normalized_dir;
-      }
-      candidate->under_build_dir = candidate->under_build_dir || under_build_dir;
-      candidate->has_non_generated_input =
-          candidate->has_non_generated_input || !generated_only_input;
+      const string directory_key =
+          DirectoryCandidateKeyForWatch(absolute_input_dir, normalized_dir);
+      MergeDirectoryCandidateForWatch(directory_key, normalized_dir,
+                                      under_build_dir, generated_only_input,
+                                      &inference.candidates);
     }
   }
 
   for (map<string, DirectoryCandidate>::const_iterator i =
-           directory_candidates.begin();
-       i != directory_candidates.end(); ++i) {
+           inference.candidates.begin();
+       i != inference.candidates.end(); ++i) {
     const DirectoryCandidate& candidate = i->second;
-    if ((has_parent_relative_inputs ||
-         has_relative_inputs_outside_build_dir ||
-         absolute_inputs_outside_build_dir.size() > 1) &&
-        candidate.under_build_dir &&
-        !candidate.has_non_generated_input) {
+    if (ShouldDropDirectoryCandidateForWatch(inference, candidate))
       continue;
-    }
     dirs->insert(candidate.dir_path);
   }
 }
