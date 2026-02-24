@@ -1698,6 +1698,80 @@ default a.o
                           fourth)
             self.assertIn('ninja: no work to do.', fourth)
 
+    def test_manifest_check_post_regen_ignores_removed_glob_watchfile(
+            self) -> None:
+        # If regeneration removes glob_watchfile, post-regeneration cache
+        # refresh must not use stale watchfile bindings from the old graph.
+        with tempfile.TemporaryDirectory() as root:
+            watched = os.path.join(root, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(root, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+
+            with open(os.path.join(root, 'touch.py'), 'w') as f:
+                f.write('import pathlib,sys\n')
+                f.write('pathlib.Path(sys.argv[1]).touch()\n')
+
+            with open(os.path.join(root, 'regen.py'), 'w') as f:
+                f.write(dedent("""\
+import pathlib
+import textwrap
+
+root = pathlib.Path(__file__).resolve().parent
+(root / 'build.ninja').write_text(textwrap.dedent('''\
+rule verify
+  command = python3 regen.py
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = python3 touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch
+default out
+'''))
+watchfile = root / 'watch_dirs.txt'
+if watchfile.exists():
+    watchfile.unlink()
+"""))
+
+            with open(os.path.join(root, 'build.ninja'), 'w') as f:
+                f.write(dedent('''\
+rule verify
+  command = python3 regen.py
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = python3 touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build out: touch
+default out
+'''))
+
+            self.assertEqual(self._run_ninja_in_dir(root), '[1/1] touch out\n')
+            self.assertEqual(self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(watched, 'new.txt')
+            third = self._run_ninja_in_dir(root)
+            self.assertGreaterEqual(
+                third.count(
+                    'regeneration complete; restarting with updated manifest...'),
+                1)
+            self.assertGreaterEqual(third.count('Re-checking...'), 1)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
+
     def test_manifest_check_explicit_builddir_keeps_generated_dirs_with_multiple_absolutes(
             self) -> None:
         # In ambiguous mixed-absolute layouts, prefer keeping build-local dirs
@@ -2614,6 +2688,189 @@ build foo: sleep
                 os.kill(proc.pid, signum)
                 proc.wait()
                 self.assertEqual(proc.returncode, 130, msg=f"For signal {signum}")
+
+
+@unittest.skipUnless(platform.system() == 'Windows', 'Windows-only tests')
+class WindowsOutput(unittest.TestCase):
+    def _create_file_and_advance_dir_mtime(
+        self,
+        directory: str,
+        filename: str,
+        content: str = '',
+        timeout_secs: float = 5.0,
+    ) -> str:
+        before = os.stat(directory).st_mtime_ns
+        path = os.path.join(directory, filename)
+        deadline = time.time() + timeout_secs
+        while True:
+            with open(path, 'w') as f:
+                f.write(content)
+            if os.stat(directory).st_mtime_ns != before:
+                return path
+            os.unlink(path)
+            if time.time() >= deadline:
+                self.fail(f"directory mtime for '{directory}' did not advance")
+            time.sleep(0.02)
+
+    def _assert_single_manifest_restart(self, output: str) -> None:
+        self.assertEqual(
+            output.count(
+                'regeneration complete; restarting with updated manifest...'),
+            1)
+        self.assertEqual(output.count('Re-checking...'), 1)
+        self.assertIn('ninja: no work to do.', output)
+
+    def _run_ninja_in_dir(
+        self,
+        cwd: str,
+        args: T.Optional[T.List[str]] = None,
+    ) -> str:
+        cmd = [NINJA_PATH]
+        if args:
+            cmd.extend(args)
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=default_env,
+            capture_output=True,
+            check=False,
+            text=True)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stderr, '')
+        return proc.stdout
+
+    def _short_path_alias(self, path: str) -> T.Optional[str]:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        get_short = kernel32.GetShortPathNameW
+        get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        get_short.restype = ctypes.c_uint
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_short(path, buffer, len(buffer))
+        if length == 0:
+            return None
+        return buffer.value
+
+    def test_manifest_check_post_regen_ignores_removed_glob_watchfile(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            watched = os.path.join(root, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(root, 'watch_dirs.txt'), 'w', newline='\n') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write('watched\n')
+
+            with open(os.path.join(root, 'touch.py'), 'w', newline='\n') as f:
+                f.write('import pathlib,sys\n')
+                f.write('pathlib.Path(sys.argv[1]).touch()\n')
+
+            with open(os.path.join(root, 'regen.py'), 'w', newline='\n') as f:
+                f.write(dedent("""\
+import pathlib
+import textwrap
+
+root = pathlib.Path(__file__).resolve().parent
+content = textwrap.dedent('''\
+rule verify
+  command = python regen.py
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = python touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch
+default out
+''')
+(root / 'build.ninja').write_text(content, newline='\\n')
+watchfile = root / 'watch_dirs.txt'
+if watchfile.exists():
+    watchfile.unlink()
+"""))
+
+            with open(os.path.join(root, 'build.ninja'), 'w', newline='\n') as f:
+                f.write(dedent('''\
+rule verify
+  command = python regen.py
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = python touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build out: touch
+default out
+'''))
+
+            self.assertEqual(self._run_ninja_in_dir(root), '[1/1] touch out\n')
+            self.assertEqual(self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(watched, 'new.txt')
+            third = self._run_ninja_in_dir(root)
+            self.assertGreaterEqual(
+                third.count(
+                    'regeneration complete; restarting with updated manifest...'),
+                1)
+            self.assertGreaterEqual(third.count('Re-checking...'), 1)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
+
+    def test_manifest_check_with_shortpath_absolute_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            short_root = self._short_path_alias(root)
+            if not short_root:
+                self.skipTest('8.3 short path alias is unavailable')
+            if os.path.normcase(short_root) == os.path.normcase(root):
+                self.skipTest('8.3 short path alias equals long path')
+
+            src_dir = os.path.join(root, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+            with open(os.path.join(root, 'touch.py'), 'w', newline='\n') as f:
+                f.write('import pathlib,sys\n')
+                f.write('pathlib.Path(sys.argv[1]).touch()\n')
+
+            with open(os.path.join(root, 'build.ninja'), 'w', newline='\n') as f:
+                f.write(dedent('''\
+rule verify
+  command = python -c "pass"
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = python touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src/a.cpp
+default out
+'''))
+
+            long_manifest = os.path.join(root, 'build.ninja')
+            short_manifest = os.path.join(short_root, 'build.ninja')
+            long_flags = ['-f', long_manifest]
+            short_flags = ['-f', short_manifest]
+
+            self.assertEqual(
+                self._run_ninja_in_dir(root, long_flags), '[1/1] touch out\n')
+            self.assertEqual(
+                self._run_ninja_in_dir(root, long_flags),
+                'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+            third = self._run_ninja_in_dir(root, short_flags)
+            self._assert_single_manifest_restart(third)
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
 #include "getopt.h"
@@ -378,11 +379,64 @@ string AbsoluteWatchPath(const string& path) {
   return absolute_path;
 }
 
+#ifdef _WIN32
+bool StripWin32VerbatimPathPrefix(string* path) {
+  static const char kVerbatimPrefix[] = "\\\\?\\";
+  static const char kVerbatimUncPrefix[] = "\\\\?\\UNC\\";
+
+  if (path->compare(0, sizeof(kVerbatimUncPrefix) - 1,
+                    kVerbatimUncPrefix) == 0) {
+    *path = "//" + path->substr(sizeof(kVerbatimUncPrefix) - 1);
+    return true;
+  }
+  if (path->compare(0, sizeof(kVerbatimPrefix) - 1,
+                    kVerbatimPrefix) == 0) {
+    *path = path->substr(sizeof(kVerbatimPrefix) - 1);
+    return true;
+  }
+  return false;
+}
+
+bool ResolveFinalPathForWatchOnWindows(const string& path, string* real_path) {
+  HANDLE handle = CreateFileA(path.c_str(), 0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                              NULL);
+  if (handle == INVALID_HANDLE_VALUE)
+    return false;
+
+  const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+  vector<char> buffer(MAX_PATH);
+  DWORD len = GetFinalPathNameByHandleA(handle, &buffer[0], buffer.size(),
+                                        flags);
+  if (len == 0) {
+    CloseHandle(handle);
+    return false;
+  }
+  if (len >= buffer.size()) {
+    buffer.resize(len + 1);
+    len = GetFinalPathNameByHandleA(handle, &buffer[0], buffer.size(), flags);
+    if (len == 0 || len >= buffer.size()) {
+      CloseHandle(handle);
+      return false;
+    }
+  }
+  CloseHandle(handle);
+
+  *real_path = string(&buffer[0], len);
+  StripWin32VerbatimPathPrefix(real_path);
+  uint64_t slash_bits;
+  CanonicalizePath(real_path, &slash_bits);
+  return true;
+}
+#endif
+
 bool ResolveRealPathForWatch(const string& path, string* real_path) {
 #ifdef _WIN32
-  (void)path;
-  (void)real_path;
-  return false;
+  if (path.empty())
+    return false;
+  return ResolveFinalPathForWatchOnWindows(path, real_path);
 #else
   if (path.empty())
     return false;
@@ -408,7 +462,6 @@ bool NormalizeDirectoryForWatch(string dir, string* normalized_dir) {
   const string cwd = AbsoluteWatchPath(".");
   if (!cwd.empty() && dir == cwd)
     return false;
-#ifndef _WIN32
   string dir_real_path;
   string cwd_real_path;
   if (ResolveRealPathForWatch(dir, &dir_real_path) &&
@@ -416,7 +469,6 @@ bool NormalizeDirectoryForWatch(string dir, string* normalized_dir) {
       dir_real_path == cwd_real_path) {
     return false;
   }
-#endif
   *normalized_dir = dir;
   return true;
 }
@@ -1080,7 +1132,6 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
         CanonicalizePath(&relative_path, &slash_bits);
         node = state_.LookupNode(relative_path);
       }
-#ifndef _WIN32
       if (!node) {
         string real_path;
         if (ResolveRealPathForWatch(path, &real_path)) {
@@ -1091,7 +1142,6 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
           }
         }
       }
-#endif
     }
   }
   if (!node)
@@ -1141,13 +1191,19 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
     *err = "stat(" + path + "): " + post_manifest_stat_err;
     return false;
   }
+  // Manifest already regenerated successfully. Refreshing directory-watch cache
+  // is best-effort because the pre-regeneration graph can reference bindings
+  // (for example glob_watchfile) removed by the regenerated manifest.
   bool post_build_watch_changed = false;
+  string post_build_watch_err;
   if (!ComputeManifestDirectoryWatchChange(&state_, node->in_edge(),
                                            &disk_interface_, build_dir_, path,
                                            post_manifest_mtime, false,
-                                           &post_build_watch_changed, err)) {
-    return false;
+                                           &post_build_watch_changed,
+                                           &post_build_watch_err)) {
+    post_build_watch_changed = false;
   }
+  (void)post_build_watch_changed;
 
   // The manifest was only rebuilt if it is now dirty (it may have been cleaned
   // by a restat).
