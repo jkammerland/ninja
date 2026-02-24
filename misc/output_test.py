@@ -1815,11 +1815,7 @@ default out
 
             self._create_file_and_advance_dir_mtime(watched, 'new.txt')
             third = self._run_ninja_in_dir(root)
-            self.assertGreaterEqual(
-                third.count(
-                    'regeneration complete; restarting with updated manifest...'),
-                1)
-            self.assertGreaterEqual(third.count('Re-checking...'), 1)
+            self._assert_single_manifest_restart(third)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
             self.assertEqual(
@@ -2948,11 +2944,7 @@ default out
 
             self._create_file_and_advance_dir_mtime(watched, 'new.txt')
             third = self._run_ninja_in_dir(root)
-            self.assertGreaterEqual(
-                third.count(
-                    'regeneration complete; restarting with updated manifest...'),
-                1)
-            self.assertGreaterEqual(third.count('Re-checking...'), 1)
+            self._assert_single_manifest_restart(third)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
             self.assertEqual(
