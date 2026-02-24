@@ -1825,6 +1825,82 @@ default out
             self.assertEqual(
                 self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
 
+    def test_manifest_check_post_regen_recomputes_inferred_dirs(
+            self) -> None:
+        # If regeneration changes source inputs from src_old to src_new, the
+        # next manifest check must watch src_new (not stale src_old cache).
+        with tempfile.TemporaryDirectory() as root:
+            py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
+            src_old = os.path.join(root, 'src_old')
+            src_new = os.path.join(root, 'src_new')
+            os.mkdir(src_old)
+            os.mkdir(src_new)
+            with open(os.path.join(src_old, 'a.cpp'), 'w'):
+                pass
+            with open(os.path.join(src_new, 'a.cpp'), 'w'):
+                pass
+
+            with open(os.path.join(root, 'regen.py'), 'w') as f:
+                f.write(dedent(f"""\
+import pathlib
+import textwrap
+
+root = pathlib.Path(__file__).resolve().parent
+(root / 'build.ninja').write_text(textwrap.dedent('''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src_new/a.cpp
+default out
+'''))
+"""))
+
+            with open(os.path.join(root, 'build.ninja'), 'w') as f:
+                f.write(dedent(f'''\
+rule verify
+  command = {py} regen.py
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src_old/a.cpp
+default out
+'''))
+
+            self.assertEqual(self._run_ninja_in_dir(root), '[1/1] touch out\n')
+            self.assertEqual(self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_old, 'trigger.cpp')
+            third = self._run_ninja_in_dir(root)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+
+            self._create_file_and_advance_dir_mtime(src_new, 'trigger.cpp')
+            fourth = self._run_ninja_in_dir(root)
+            self.assertIn('Re-checking...', fourth)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+
+            self.assertEqual(self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
+
     def test_manifest_check_explicit_builddir_keeps_generated_dirs_with_multiple_absolutes(
             self) -> None:
         # In ambiguous mixed-absolute layouts, prefer keeping build-local dirs

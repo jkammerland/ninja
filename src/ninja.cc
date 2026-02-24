@@ -1101,14 +1101,16 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
     return false;
   }
 
-  if (cache.found && cache.compatible_version &&
-      cache.mtimes != current_mtimes) {
+  bool cache_manifest_matches_current =
+      cache.found && cache.compatible_version && cache.has_manifest_entry &&
+      cache.manifest_path == manifest_path &&
+      cache.manifest_mtime == manifest_mtime;
+
+  if (cache_manifest_matches_current && cache.mtimes != current_mtimes) {
     *changed = true;
   }
 
-  bool cache_manifest_mismatch = !cache.compatible_version ||
-      !cache.has_manifest_entry || cache.manifest_path != manifest_path ||
-      cache.manifest_mtime != manifest_mtime;
+  bool cache_manifest_mismatch = !cache_manifest_matches_current;
   bool cache_inferred_dirs_mismatch =
       !cache.compatible_version || cache.inferred_dirs != inferred_dirs;
   bool should_write_cache =
@@ -1223,7 +1225,7 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   if (!ComputeManifestDirectoryWatchChange(&state_, node->in_edge(),
                                            &disk_interface_, build_dir_,
                                            manifest_path,
-                                           post_manifest_mtime, false,
+                                           manifest_mtime, false,
                                            &post_build_watch_changed,
                                            &post_build_watch_err)) {
     // Avoid carrying stale cache state into the next cycle.
