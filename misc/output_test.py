@@ -812,6 +812,73 @@ default out
             self.assertEqual(
                 self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
 
+    def test_manifest_check_migrates_v1_cache_and_recomputes_inferred_dirs(
+            self) -> None:
+        # Legacy v1 caches should be upgraded by recomputing inferred dirs.
+        with tempfile.TemporaryDirectory() as root:
+            source_root = os.path.join(root, 'srcroot')
+            build_dir = os.path.join(root, 'build')
+            os.mkdir(source_root)
+            os.mkdir(build_dir)
+
+            source_dir = os.path.join(source_root, 'src')
+            os.mkdir(source_dir)
+            with open(os.path.join(source_dir, 'a.cpp'), 'w'):
+                pass
+
+            generated_dir = os.path.join(build_dir, 'gen')
+            os.mkdir(generated_dir)
+            with open(os.path.join(generated_dir, 'generated.cpp'), 'w'):
+                pass
+
+            with open(os.path.join(build_dir, 'build.ninja'), 'w') as f:
+                f.write(dedent('''\
+builddir = .
+
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build gen/generated.h: phony
+build build.ninja: verify
+build out: touch ../srcroot/src/a.cpp gen/generated.cpp
+default out
+'''))
+
+            self.assertEqual(
+                self._run_ninja_in_dir(build_dir), '[1/1] touch out\n')
+            self.assertEqual(
+                self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
+            generated_mtime = os.stat(generated_dir).st_mtime_ns
+            cache_path = os.path.join(build_dir, '.ninja_glob_dirs')
+            with open(cache_path, 'w') as f:
+                f.write('ninja_glob_dirs_v1\n')
+                f.write(f'gen\t{generated_mtime}\n')
+
+            self.assertEqual(
+                self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertIn('ninja_glob_dirs_v3\n', cache_content)
+            self.assertIn('inferred\t../srcroot/src\n', cache_content)
+            self.assertNotIn('inferred\tgen\n', cache_content)
+
+            self._create_file_and_advance_dir_mtime(source_dir, 'new.cpp')
+            third = self._run_ninja_in_dir(build_dir)
+            self._assert_single_manifest_restart(third)
+
+            self._create_file_and_advance_dir_mtime(generated_dir, 'new.cpp')
+            self.assertEqual(
+                self._run_ninja_in_dir(build_dir), 'ninja: no work to do.\n')
+
     def test_manifest_check_preserves_future_cache_schema(self) -> None:
         with BuildDir('''rule verify
   command = printf ""
@@ -1087,6 +1154,48 @@ default out
                 self._assert_single_manifest_restart(third)
                 self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
+    def test_manifest_check_ignores_cwd_equivalent_absolute_input_dirs(
+            self) -> None:
+        # Absolute paths under cwd should not infer cwd itself as a watched dir.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch ${absolute_input}
+default out
+''') as b:
+            absolute_input = os.path.join(b.path, 'a.cpp')
+            with open(absolute_input, 'w'):
+                pass
+
+            with open(os.path.join(b.path, 'build.ninja'), 'r') as f:
+                plan = f.read()
+            plan = plan.replace(
+                '${absolute_input}',
+                self._escape_ninja_path(absolute_input.replace('\\', '/')))
+            with open(os.path.join(b.path, 'build.ninja'), 'w') as f:
+                f.write(plan)
+
+            self.assertEqual(b.run(pipe=True), '[1/1] touch out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            cwd_entry = b.path.replace('\\', '/')
+            self.assertNotIn(f'inferred\t{cwd_entry}\n', cache_content)
+
+            # A no-op run should stay clean and not enter manifest-check loops.
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
     def test_manifest_check_in_tree_with_absolute_manifest_path(self) -> None:
         # Absolute -f paths should not change inferred-watch semantics.
         with BuildDir('''rule verify
@@ -1138,6 +1247,56 @@ default out
                 third = b.run(flags=flags, pipe=True)
                 self._assert_single_manifest_restart(third)
                 self.assertEqual(b.run(flags=flags, pipe=True), 'ninja: no work to do.\n')
+
+    def test_manifest_check_with_absolute_symlink_manifest_path(self) -> None:
+        # Absolute -f symlink aliases should still resolve manifest checks.
+        with tempfile.TemporaryDirectory() as root:
+            real_dir = os.path.join(root, 'real')
+            alias_dir = os.path.join(root, 'alias')
+            os.mkdir(real_dir)
+            try:
+                os.symlink(real_dir, alias_dir)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlink creation is not available')
+
+            src_dir = os.path.join(real_dir, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            with open(os.path.join(real_dir, 'build.ninja'), 'w') as f:
+                f.write(dedent('''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src/a.cpp
+default out
+'''))
+
+            real_args = ['-f', os.path.join(real_dir, 'build.ninja')]
+            self.assertEqual(
+                self._run_ninja_in_dir(real_dir, real_args), '[1/1] touch out\n')
+            self.assertEqual(
+                self._run_ninja_in_dir(real_dir, real_args),
+                'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+
+            alias_args = ['-f', os.path.join(alias_dir, 'build.ninja')]
+            third = self._run_ninja_in_dir(real_dir, alias_args)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
 
     def test_manifest_check_unset_builddir_uses_manifest_directory(self) -> None:
         # When builddir is unset and Ninja is invoked with -f build/build.ninja,
@@ -1231,6 +1390,73 @@ default out
                           third)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn('COPY out', third)
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+    def test_manifest_check_on_template_so_in_input_change(self) -> None:
+        # Template inputs like *.so.in are source-like and should stay watched.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule copy
+  command = touch $out
+  description = COPY $out
+
+build build.ninja: verify
+build out: copy src/template.so.in
+default out
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'template.so.in'), 'w'):
+                pass
+
+            self.assertEqual(b.run(pipe=True), '[1/1] COPY out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_dir, 'new_template.in')
+
+            third = b.run(pipe=True)
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+            self.assertNotIn('COPY out', third)
+
+    def test_manifest_check_ignores_versioned_shared_object_inputs(self) -> None:
+        # Versioned shared objects are binary artifacts and should be skipped.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule copy
+  command = touch $out
+  description = COPY $out
+
+build build.ninja: verify
+build out: copy lib/libfoo.so.1
+default out
+''') as b:
+            lib_dir = os.path.join(b.path, 'lib')
+            os.mkdir(lib_dir)
+            with open(os.path.join(lib_dir, 'libfoo.so.1'), 'w'):
+                pass
+
+            self.assertEqual(b.run(pipe=True), '[1/1] COPY out\n')
+            self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
+
+            cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertNotIn('inferred\tlib\n', cache_content)
+
+            self._create_file_and_advance_dir_mtime(lib_dir, 'newlib.so.2')
             self.assertEqual(b.run(pipe=True), 'ninja: no work to do.\n')
 
     def test_manifest_check_no_regen_loop_when_regen_touches_build_local_dir(
@@ -1407,6 +1633,58 @@ default a.o
             with open(cache_path) as f:
                 cache_content = f.read()
             self.assertNotIn('mtime\t.\t', cache_content)
+            self.assertIn('mtime\twatched\t', cache_content)
+
+            self._create_file_and_advance_dir_mtime(b.path, 'watch_trigger.txt')
+            third = b.run(pipe=True)
+            self.assertEqual(third, 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(watched, 'entry.txt')
+            fourth = b.run(pipe=True)
+            self.assertIn('Re-checking...', fourth)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          fourth)
+            self.assertIn('ninja: no work to do.', fourth)
+
+    def test_manifest_check_with_glob_watchfile_ignores_cwd_absolute_entry(
+            self) -> None:
+        # Absolute cwd aliases in glob_watchfile are as noisy as "." and must
+        # be ignored.
+        with BuildDir('''rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule cc
+  command = touch $out
+  description = CXX $out
+
+build build.ninja: verify
+  glob_watchfile = watch_dirs.txt
+build a.o: cc src/a.cpp
+default a.o
+''') as b:
+            src_dir = os.path.join(b.path, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            watched = os.path.join(b.path, 'watched')
+            os.mkdir(watched)
+            with open(os.path.join(b.path, 'watch_dirs.txt'), 'w') as f:
+                f.write('ninja_glob_watch_dirs_v1\n')
+                f.write(f'{b.path.replace("\\\\", "/")}\n')
+                f.write('watched\n')
+
+            self.assertEqual(b.run(pipe=True), '[1/1] CXX a.o\n')
+
+            cache_path = os.path.join(b.path, '.ninja_glob_dirs')
+            with open(cache_path) as f:
+                cache_content = f.read()
+            self.assertNotIn(f'mtime\t{b.path.replace("\\\\", "/")}\t',
+                             cache_content)
             self.assertIn('mtime\twatched\t', cache_content)
 
             self._create_file_and_advance_dir_mtime(b.path, 'watch_trigger.txt')
@@ -2307,9 +2585,18 @@ build stamp-2: touch || dd-2
         actual = cm.exception.cooked_output
         self.assertEqual(cm.exception.returncode, 1)
         # dd-1 and dd-2 are both ready initially; scheduler order is not stable.
-        self.assertIn(r"printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1", actual)
-        self.assertIn(r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2", actual)
-        self.assertTrue(actual.endswith("ninja: build stopped: multiple rules generate out.\n"))
+        self.assertIn(
+            r"printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1",
+            actual)
+        self.assertIn(
+            r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2",
+            actual)
+        # The conflict must be detected before any touch command runs.
+        self.assertNotIn('touch stamp-1 out', actual)
+        self.assertNotIn('touch stamp-2 out', actual)
+        self.assertTrue(
+            actual.endswith(
+                "ninja: build stopped: multiple rules generate out.\n"))
 
     def test_issue_2681(self):
         """Ninja should return a status code of 130 when interrupted."""

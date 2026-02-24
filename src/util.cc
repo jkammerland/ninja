@@ -1004,6 +1004,20 @@ std::string GetWorkingDirectory() {
   return ret;
 }
 
+string PathDirName(const string& path) {
+  string::size_type slash_pos = path.find_last_of('/');
+  if (slash_pos == string::npos)
+    return ".";
+  if (slash_pos == 0)
+    return "/";
+#ifdef _WIN32
+  if (slash_pos == 2 && path.size() >= 3 && islatinalpha(path[0]) &&
+      path[1] == ':')
+    return path.substr(0, 3);
+#endif
+  return path.substr(0, slash_pos);
+}
+
 bool MakePathRelativeTo(const string& path, const string& parent,
                         string* relative_path) {
   if (parent.empty())

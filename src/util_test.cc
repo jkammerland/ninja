@@ -188,6 +188,18 @@ TEST(Util, MakePathRelativeTo) {
 #endif
 }
 
+TEST(Util, PathDirName) {
+  EXPECT_EQ(".", PathDirName("build.ninja"));
+  EXPECT_EQ("dir", PathDirName("dir/build.ninja"));
+  EXPECT_EQ("/tmp/work", PathDirName("/tmp/work/build.ninja"));
+  EXPECT_EQ("/", PathDirName("/build.ninja"));
+
+#ifdef _WIN32
+  EXPECT_EQ("C:/", PathDirName("C:/build.ninja"));
+  EXPECT_EQ("D:/work", PathDirName("D:/work/build.ninja"));
+#endif
+}
+
 #ifdef _WIN32
 TEST(CanonicalizePath, PathSamplesWindows) {
   string path;

@@ -268,15 +268,6 @@ int GuessParallelism() {
   }
 }
 
-string PathDirName(const string& path) {
-  string::size_type slash_pos = path.find_last_of('/');
-  if (slash_pos == string::npos)
-    return ".";
-  if (slash_pos == 0)
-    return "/";
-  return path.substr(0, slash_pos);
-}
-
 bool IsAbsolutePathForWatch(const string& path) {
   if (path.empty())
     return false;
@@ -331,9 +322,30 @@ string LowercaseASCII(string value) {
   return value;
 }
 
+bool HasVersionedSharedObjectSuffix(const string& path) {
+  const string::size_type so_pos = path.rfind(".so.");
+  if (so_pos == string::npos)
+    return false;
+  const string::size_type version_pos = so_pos + 4;
+  if (version_pos >= path.size())
+    return false;
+  bool saw_digit = false;
+  for (string::size_type i = version_pos; i < path.size(); ++i) {
+    char c = path[i];
+    if (c == '.') {
+      continue;
+    }
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    saw_digit = true;
+  }
+  return saw_digit;
+}
+
 bool ShouldInferWatchDirectoryForInput(const string& path) {
   const string lower = LowercaseASCII(path);
-  if (HasStringSuffix(lower, ".so") || lower.find(".so.") != string::npos)
+  if (HasStringSuffix(lower, ".so") || HasVersionedSharedObjectSuffix(lower))
     return false;
 
   static const char* const kSkippedSuffixes[] = {
@@ -366,6 +378,24 @@ string AbsoluteWatchPath(const string& path) {
   return absolute_path;
 }
 
+bool ResolveRealPathForWatch(const string& path, string* real_path) {
+#ifdef _WIN32
+  (void)path;
+  (void)real_path;
+  return false;
+#else
+  if (path.empty())
+    return false;
+  char resolved_path[PATH_MAX];
+  if (!realpath(path.c_str(), resolved_path))
+    return false;
+  *real_path = resolved_path;
+  uint64_t slash_bits;
+  CanonicalizePath(real_path, &slash_bits);
+  return true;
+#endif
+}
+
 bool NormalizeDirectoryForWatch(string dir, string* normalized_dir) {
   if (dir.empty())
     dir = ".";
@@ -375,6 +405,18 @@ bool NormalizeDirectoryForWatch(string dir, string* normalized_dir) {
   // bookkeeping files there (for example .ninja_lock and .ninja_log).
   if (dir == ".")
     return false;
+  const string cwd = AbsoluteWatchPath(".");
+  if (!cwd.empty() && dir == cwd)
+    return false;
+#ifndef _WIN32
+  string dir_real_path;
+  string cwd_real_path;
+  if (ResolveRealPathForWatch(dir, &dir_real_path) &&
+      ResolveRealPathForWatch(cwd, &cwd_real_path) &&
+      dir_real_path == cwd_real_path) {
+    return false;
+  }
+#endif
   *normalized_dir = dir;
   return true;
 }
@@ -1038,6 +1080,18 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
         CanonicalizePath(&relative_path, &slash_bits);
         node = state_.LookupNode(relative_path);
       }
+#ifndef _WIN32
+      if (!node) {
+        string real_path;
+        if (ResolveRealPathForWatch(path, &real_path)) {
+          node = state_.LookupNode(real_path);
+          if (!node && MakePathRelativeTo(real_path, cwd, &relative_path)) {
+            CanonicalizePath(&relative_path, &slash_bits);
+            node = state_.LookupNode(relative_path);
+          }
+        }
+      }
+#endif
     }
   }
   if (!node)

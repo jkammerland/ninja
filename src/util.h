@@ -105,6 +105,10 @@ double GetLoadAverage();
 /// a wrapper for getcwd()
 std::string GetWorkingDirectory();
 
+/// Returns the parent directory part of |path|, normalized to Ninja's slash
+/// convention.
+std::string PathDirName(const std::string& path);
+
 /// If |path| is a strict child of |parent|, write the relative suffix to
 /// |relative_path| and return true. Returns false otherwise.
 bool MakePathRelativeTo(const std::string& path, const std::string& parent,
