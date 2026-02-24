@@ -1298,6 +1298,56 @@ default out
                           third)
             self.assertIn('ninja: no work to do.', third)
 
+    def test_manifest_check_with_relative_symlink_manifest_path(self) -> None:
+        # Relative -f symlink aliases should resolve to the same manifest node.
+        with tempfile.TemporaryDirectory() as root:
+            real_dir = os.path.join(root, 'real')
+            alias_dir = os.path.join(root, 'alias')
+            os.mkdir(real_dir)
+            try:
+                os.symlink(real_dir, alias_dir)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlink creation is not available')
+
+            src_dir = os.path.join(real_dir, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+
+            with open(os.path.join(real_dir, 'build.ninja'), 'w') as f:
+                f.write(dedent('''\
+rule verify
+  command = printf ""
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = touch $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src/a.cpp
+default out
+'''))
+
+            self.assertEqual(self._run_ninja_in_dir(real_dir), '[1/1] touch out\n')
+            self.assertEqual(
+                self._run_ninja_in_dir(real_dir),
+                'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+
+            relative_alias_manifest = os.path.relpath(
+                os.path.join(alias_dir, 'build.ninja'), real_dir)
+            third = self._run_ninja_in_dir(
+                real_dir, ['-f', relative_alias_manifest])
+            self.assertIn('Re-checking...', third)
+            self.assertIn('regeneration complete; restarting with updated manifest...',
+                          third)
+            self.assertIn('ninja: no work to do.', third)
+
     def test_manifest_check_unset_builddir_uses_manifest_directory(self) -> None:
         # When builddir is unset and Ninja is invoked with -f build/build.ninja,
         # treat the manifest directory as the effective build root.
@@ -1703,6 +1753,7 @@ default a.o
         # If regeneration removes glob_watchfile, post-regeneration cache
         # refresh must not use stale watchfile bindings from the old graph.
         with tempfile.TemporaryDirectory() as root:
+            py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
             watched = os.path.join(root, 'watched')
             os.mkdir(watched)
             with open(os.path.join(root, 'watch_dirs.txt'), 'w') as f:
@@ -1714,21 +1765,21 @@ default a.o
                 f.write('pathlib.Path(sys.argv[1]).touch()\n')
 
             with open(os.path.join(root, 'regen.py'), 'w') as f:
-                f.write(dedent("""\
+                f.write(dedent(f"""\
 import pathlib
 import textwrap
 
 root = pathlib.Path(__file__).resolve().parent
 (root / 'build.ninja').write_text(textwrap.dedent('''\
 rule verify
-  command = python3 regen.py
+  command = {py} regen.py
   description = Re-checking...
   pool = console
   restat = 1
   generator = 1
 
 rule touch
-  command = python3 touch.py $out
+  command = {py} touch.py $out
   description = touch $out
 
 build build.ninja: verify
@@ -1741,16 +1792,16 @@ if watchfile.exists():
 """))
 
             with open(os.path.join(root, 'build.ninja'), 'w') as f:
-                f.write(dedent('''\
+                f.write(dedent(f'''\
 rule verify
-  command = python3 regen.py
+  command = {py} regen.py
   description = Re-checking...
   pool = console
   restat = 1
   generator = 1
 
 rule touch
-  command = python3 touch.py $out
+  command = {py} touch.py $out
   description = touch $out
 
 build build.ninja: verify
@@ -1771,6 +1822,8 @@ default out
             self.assertGreaterEqual(third.count('Re-checking...'), 1)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
+            self.assertEqual(
+                self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
 
     def test_manifest_check_explicit_builddir_keeps_generated_dirs_with_multiple_absolutes(
             self) -> None:
@@ -2720,6 +2773,9 @@ class WindowsOutput(unittest.TestCase):
         self.assertEqual(output.count('Re-checking...'), 1)
         self.assertIn('ninja: no work to do.', output)
 
+    def _escape_ninja_path(self, path: str) -> str:
+        return path.replace('$', '$$').replace(':', '$:').replace(' ', '$ ')
+
     def _run_ninja_in_dir(
         self,
         cwd: str,
@@ -2753,6 +2809,7 @@ class WindowsOutput(unittest.TestCase):
 
     def test_manifest_check_post_regen_ignores_removed_glob_watchfile(self) -> None:
         with tempfile.TemporaryDirectory() as root:
+            py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
             watched = os.path.join(root, 'watched')
             os.mkdir(watched)
             with open(os.path.join(root, 'watch_dirs.txt'), 'w', newline='\n') as f:
@@ -2764,21 +2821,21 @@ class WindowsOutput(unittest.TestCase):
                 f.write('pathlib.Path(sys.argv[1]).touch()\n')
 
             with open(os.path.join(root, 'regen.py'), 'w', newline='\n') as f:
-                f.write(dedent("""\
+                f.write(dedent(f"""\
 import pathlib
 import textwrap
 
 root = pathlib.Path(__file__).resolve().parent
 content = textwrap.dedent('''\
 rule verify
-  command = python regen.py
+  command = {py} regen.py
   description = Re-checking...
   pool = console
   restat = 1
   generator = 1
 
 rule touch
-  command = python touch.py $out
+  command = {py} touch.py $out
   description = touch $out
 
 build build.ninja: verify
@@ -2792,16 +2849,16 @@ if watchfile.exists():
 """))
 
             with open(os.path.join(root, 'build.ninja'), 'w', newline='\n') as f:
-                f.write(dedent('''\
+                f.write(dedent(f'''\
 rule verify
-  command = python regen.py
+  command = {py} regen.py
   description = Re-checking...
   pool = console
   restat = 1
   generator = 1
 
 rule touch
-  command = python touch.py $out
+  command = {py} touch.py $out
   description = touch $out
 
 build build.ninja: verify
@@ -2822,6 +2879,8 @@ default out
             self.assertGreaterEqual(third.count('Re-checking...'), 1)
             self.assertIn('ninja: no work to do.', third)
             self.assertNotIn("glob watch file 'watch_dirs.txt' not found", third)
+            self.assertEqual(
+                self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
 
     def test_manifest_check_with_shortpath_absolute_manifest_path(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -2838,18 +2897,19 @@ default out
             with open(os.path.join(root, 'touch.py'), 'w', newline='\n') as f:
                 f.write('import pathlib,sys\n')
                 f.write('pathlib.Path(sys.argv[1]).touch()\n')
+            py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
 
             with open(os.path.join(root, 'build.ninja'), 'w', newline='\n') as f:
-                f.write(dedent('''\
+                f.write(dedent(f'''\
 rule verify
-  command = python -c "pass"
+  command = {py} -c "pass"
   description = Re-checking...
   pool = console
   restat = 1
   generator = 1
 
 rule touch
-  command = python touch.py $out
+  command = {py} touch.py $out
   description = touch $out
 
 build build.ninja: verify
@@ -2870,6 +2930,52 @@ default out
 
             self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
             third = self._run_ninja_in_dir(root, short_flags)
+            self._assert_single_manifest_restart(third)
+
+    def test_manifest_check_with_shortpath_relative_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            short_root = self._short_path_alias(root)
+            if not short_root:
+                self.skipTest('8.3 short path alias is unavailable')
+            if os.path.normcase(short_root) == os.path.normcase(root):
+                self.skipTest('8.3 short path alias equals long path')
+
+            src_dir = os.path.join(root, 'src')
+            os.mkdir(src_dir)
+            with open(os.path.join(src_dir, 'a.cpp'), 'w'):
+                pass
+            with open(os.path.join(root, 'touch.py'), 'w', newline='\n') as f:
+                f.write('import pathlib,sys\n')
+                f.write('pathlib.Path(sys.argv[1]).touch()\n')
+            py = self._escape_ninja_path(sys.executable.replace('\\', '/'))
+
+            with open(os.path.join(root, 'build.ninja'), 'w', newline='\n') as f:
+                f.write(dedent(f'''\
+rule verify
+  command = {py} -c "pass"
+  description = Re-checking...
+  pool = console
+  restat = 1
+  generator = 1
+
+rule touch
+  command = {py} touch.py $out
+  description = touch $out
+
+build build.ninja: verify
+build out: touch src/a.cpp
+default out
+'''))
+
+            self.assertEqual(self._run_ninja_in_dir(root), '[1/1] touch out\n')
+            self.assertEqual(
+                self._run_ninja_in_dir(root), 'ninja: no work to do.\n')
+
+            self._create_file_and_advance_dir_mtime(src_dir, 'new.cpp')
+            relative_short_manifest = os.path.relpath(
+                os.path.join(short_root, 'build.ninja'), root)
+            third = self._run_ninja_in_dir(
+                root, ['-f', relative_short_manifest])
             self._assert_single_manifest_restart(third)
 
 

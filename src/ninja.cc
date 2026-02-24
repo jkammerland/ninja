@@ -398,13 +398,30 @@ bool StripWin32VerbatimPathPrefix(string* path) {
 }
 
 bool ResolveFinalPathForWatchOnWindows(const string& path, string* real_path) {
+  auto fallback_to_full_path = [&]() -> bool {
+    vector<char> buffer(MAX_PATH);
+    DWORD len = GetFullPathNameA(path.c_str(), buffer.size(), &buffer[0], NULL);
+    if (len == 0)
+      return false;
+    if (len >= buffer.size()) {
+      buffer.resize(len + 1);
+      len = GetFullPathNameA(path.c_str(), buffer.size(), &buffer[0], NULL);
+      if (len == 0 || len >= buffer.size())
+        return false;
+    }
+    *real_path = string(&buffer[0], len);
+    uint64_t slash_bits;
+    CanonicalizePath(real_path, &slash_bits);
+    return true;
+  };
+
   HANDLE handle = CreateFileA(path.c_str(), 0,
                               FILE_SHARE_READ | FILE_SHARE_WRITE |
                                   FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
                               NULL);
   if (handle == INVALID_HANDLE_VALUE)
-    return false;
+    return fallback_to_full_path();
 
   const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
   vector<char> buffer(MAX_PATH);
@@ -412,14 +429,14 @@ bool ResolveFinalPathForWatchOnWindows(const string& path, string* real_path) {
                                         flags);
   if (len == 0) {
     CloseHandle(handle);
-    return false;
+    return fallback_to_full_path();
   }
   if (len >= buffer.size()) {
     buffer.resize(len + 1);
     len = GetFinalPathNameByHandleA(handle, &buffer[0], buffer.size(), flags);
     if (len == 0 || len >= buffer.size()) {
       CloseHandle(handle);
-      return false;
+      return fallback_to_full_path();
     }
   }
   CloseHandle(handle);
@@ -440,10 +457,11 @@ bool ResolveRealPathForWatch(const string& path, string* real_path) {
 #else
   if (path.empty())
     return false;
-  char resolved_path[PATH_MAX];
-  if (!realpath(path.c_str(), resolved_path))
+  char* resolved_path = realpath(path.c_str(), NULL);
+  if (!resolved_path)
     return false;
   *real_path = resolved_path;
+  free(resolved_path);
   uint64_t slash_bits;
   CanonicalizePath(real_path, &slash_bits);
   return true;
@@ -1115,31 +1133,34 @@ bool ComputeManifestDirectoryWatchChange(State* state, Edge* manifest_edge,
 bool NinjaMain::RebuildManifest(const char* input_file, string* err,
                                 Status* status, bool* manifest_phase_ran) {
   *manifest_phase_ran = false;
-  string path = input_file;
-  if (path.empty()) {
+  string manifest_lookup_path = input_file;
+  if (manifest_lookup_path.empty()) {
     *err = "empty path";
     return false;
   }
   uint64_t slash_bits;  // Unused because this path is only used for lookup.
-  CanonicalizePath(&path, &slash_bits);
-  Node* node = state_.LookupNode(path);
-  if (!node && IsAbsolutePathForWatch(path)) {
-    string cwd = GetWorkingDirectory();
-    if (!cwd.empty()) {
-      CanonicalizePath(&cwd, &slash_bits);
+  CanonicalizePath(&manifest_lookup_path, &slash_bits);
+  Node* node = state_.LookupNode(manifest_lookup_path);
+  string cwd = GetWorkingDirectory();
+  if (!cwd.empty())
+    CanonicalizePath(&cwd, &slash_bits);
+  if (!node) {
+    if (IsAbsolutePathForWatch(manifest_lookup_path) && !cwd.empty()) {
       string relative_path;
-      if (MakePathRelativeTo(path, cwd, &relative_path)) {
+      if (MakePathRelativeTo(manifest_lookup_path, cwd, &relative_path)) {
         CanonicalizePath(&relative_path, &slash_bits);
         node = state_.LookupNode(relative_path);
       }
-      if (!node) {
-        string real_path;
-        if (ResolveRealPathForWatch(path, &real_path)) {
-          node = state_.LookupNode(real_path);
-          if (!node && MakePathRelativeTo(real_path, cwd, &relative_path)) {
-            CanonicalizePath(&relative_path, &slash_bits);
-            node = state_.LookupNode(relative_path);
-          }
+    }
+    if (!node) {
+      string real_path;
+      if (ResolveRealPathForWatch(manifest_lookup_path, &real_path)) {
+        node = state_.LookupNode(real_path);
+        string relative_real_path;
+        if (!node && !cwd.empty() &&
+            MakePathRelativeTo(real_path, cwd, &relative_real_path)) {
+          CanonicalizePath(&relative_real_path, &slash_bits);
+          node = state_.LookupNode(relative_real_path);
         }
       }
     }
@@ -1147,16 +1168,19 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   if (!node)
     return false;
 
+  string manifest_path = node->path();
+  CanonicalizePath(&manifest_path, &slash_bits);
   string manifest_stat_err;
-  TimeStamp manifest_mtime = disk_interface_.Stat(path, &manifest_stat_err);
+  TimeStamp manifest_mtime =
+      disk_interface_.Stat(manifest_path, &manifest_stat_err);
   if (manifest_mtime < 0) {
-    *err = "stat(" + path + "): " + manifest_stat_err;
+    *err = "stat(" + manifest_path + "): " + manifest_stat_err;
     return false;
   }
 
   bool watch_changed = false;
   if (!ComputeManifestDirectoryWatchChange(
-          &state_, node->in_edge(), &disk_interface_, build_dir_, path,
+          &state_, node->in_edge(), &disk_interface_, build_dir_, manifest_path,
           manifest_mtime, true,
           &watch_changed, err)) {
     return false;
@@ -1185,10 +1209,10 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
     return false;
 
   string post_manifest_stat_err;
-  TimeStamp post_manifest_mtime = disk_interface_.Stat(path,
-                                                       &post_manifest_stat_err);
+  TimeStamp post_manifest_mtime =
+      disk_interface_.Stat(manifest_path, &post_manifest_stat_err);
   if (post_manifest_mtime < 0) {
-    *err = "stat(" + path + "): " + post_manifest_stat_err;
+    *err = "stat(" + manifest_path + "): " + post_manifest_stat_err;
     return false;
   }
   // Manifest already regenerated successfully. Refreshing directory-watch cache
@@ -1197,10 +1221,15 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   bool post_build_watch_changed = false;
   string post_build_watch_err;
   if (!ComputeManifestDirectoryWatchChange(&state_, node->in_edge(),
-                                           &disk_interface_, build_dir_, path,
+                                           &disk_interface_, build_dir_,
+                                           manifest_path,
                                            post_manifest_mtime, false,
                                            &post_build_watch_changed,
                                            &post_build_watch_err)) {
+    // Avoid carrying stale cache state into the next cycle.
+    const string cache_path =
+        DirectoryWatchCachePath(build_dir_, manifest_path);
+    disk_interface_.RemoveFile(cache_path);
     post_build_watch_changed = false;
   }
   (void)post_build_watch_changed;
